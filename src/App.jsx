@@ -184,33 +184,7 @@ const [startDate, setStartDate] = useState(() => {
 
   
   // ===== Load persisted state (once) =====
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const data = JSON.parse(raw);
-      if (data && typeof data === "object") {
-        if (typeof data.startDate === "string") setStartDate(data.startDate);
-        if (Array.isArray(data.events)) setEvents(data.events);
-        if (Array.isArray(data.categories)) setCategories(data.categories);
-        if (typeof data.sidebarWidthPx === "number") setSidebarWidthPx(data.sidebarWidthPx);
-        if (data.sidebarPos === "left" || data.sidebarPos === "right") setSidebarPos(data.sidebarPos);
-        if (typeof data.dayColWidthPx === "number") setDayColWidthPx(data.dayColWidthPx);
-        if (typeof data.sumPlacedOnly === "boolean") setSumPlacedOnly(data.sumPlacedOnly);
-        if (typeof data.filterCategory === "string") setFilterCategory(data.filterCategory);
-        if (typeof data.filterOrg === "string") setFilterOrg(data.filterOrg);
-        if (typeof data.filterConfirmed === "string") setFilterConfirmed(data.filterConfirmed);
-        if (typeof data.searchText === "string") setSearchText(data.searchText);
-      }
-    } catch (e) {
-      console.warn("Failed to load saved schedule:", e);
-    }
-    if (typeof data.showThumbs === "boolean") setShowThumbs(data.showThumbs);
-  if (typeof data.showPricesOnExport === "boolean") setShowPricesOnExport(data.showPricesOnExport);
-};
-
-  }, []);
-
+loadFromStorage()
   const catByKey = useMemo(
     () => Object.fromEntries(categories.map((c) => [c.key, c])),
     [categories]
