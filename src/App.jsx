@@ -95,15 +95,12 @@ export default function InteractiveSchedule() {
     contact: "",
     organization: "",
     phone: "",
-    imageDataUrl: ""
+    imageDataUrl: "",
   });
   const [draggedEventId, setDraggedEventId] = useState(null);
   const [selectedEventId, setSelectedEventId] = useState(null);
   const [conflictMsg, setConflictMsg] = useState("");
-  
-  const [showThumbs, setShowThumbs] = useState(true);
-  const [showPricesOnExport, setShowPricesOnExport] = useState(true);
-const [startDate, setStartDate] = useState(() => {
+  const [startDate, setStartDate] = useState(() => {
     const today = new Date();
     const y = today.getFullYear();
     const m = (today.getMonth() + 1).toString().padStart(2, "0");
@@ -120,6 +117,8 @@ const [startDate, setStartDate] = useState(() => {
   const [dayColWidthPx, setDayColWidthPx] = useState(176); // adjustable day column width
   const [sidebarWidthPx, setSidebarWidthPx] = useState(320); // resizable sidebar
   const [sidebarPos, setSidebarPos] = useState("left"); // "left" | "right"
+  const [showThumbs, setShowThumbs] = useState(true);
+  const [showPricesOnExport, setShowPricesOnExport] = useState(true);
 
   // resizer refs (sidebar)
   const isResizingSidebar = useRef(false);
@@ -184,7 +183,42 @@ const [startDate, setStartDate] = useState(() => {
 
   
   // ===== Load persisted state (once) =====
-loadFromStorage()
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (data && typeof data === "object") {
+        if (typeof data.startDate === "string") setStartDate(data.startDate);
+        if (Array.isArray(data.events)) setEvents(data.events);
+        if (Array.isArray(data.categories)) setCategories(data.categories);
+        if (typeof data.sidebarWidthPx === "number") setSidebarWidthPx(data.sidebarWidthPx);
+        if (data.sidebarPos === "left" || data.sidebarPos === "right") setSidebarPos(data.sidebarPos);
+        if (typeof data.dayColWidthPx === "number") setDayColWidthPx(data.dayColWidthPx);
+        if (typeof data.sumPlacedOnly === "boolean") setSumPlacedOnly(data.sumPlacedOnly);
+        if (typeof data.filterCategory === "string") setFilterCategory(data.filterCategory);
+        if (typeof data.filterOrg === "string") setFilterOrg(data.filterOrg);
+        if (typeof data.filterConfirmed === "string") setFilterConfirmed(data.filterConfirmed);
+        if (typeof data.searchText === "string") setSearchText(data.searchText);
+        if (typeof data.showThumbs === "boolean") setShowThumbs(data.showThumbs);
+        if (typeof data.showPricesOnExport === "boolean") setShowPricesOnExport(data.showPricesOnExport);
+      }
+    } catch (e) {
+      console.warn("Failed to load saved schedule:", e);
+    }
+  }, []);
+
+  // Print-price CSS toggle
+  useEffect(() => {
+    const style = document.createElement("style");
+    style.innerHTML = `@media print { .hide-prices-print .price-inline, .hide-prices-print .price-total { display: none !important; } }`;
+    document.head.appendChild(style);
+    return () => style.remove();
+  }, []);
+  useEffect(() => {
+    document.body.classList.toggle("hide-prices-print", !showPricesOnExport);
+  }, [showPricesOnExport]);
+
   const catByKey = useMemo(
     () => Object.fromEntries(categories.map((c) => [c.key, c])),
     [categories]
@@ -239,6 +273,8 @@ loadFromStorage()
       description: "",
       contact: "",
       organization: "",
+      phone: "",
+      imageDataUrl: "",
     });
   };
 
@@ -255,7 +291,7 @@ loadFromStorage()
     }
     if (copy) {
       const clone = { ...candidate, id: Date.now() + Math.random() };
-      setEvents((prev) => [...prev, { ...clone }]);
+      setEvents((prev) => [...prev, clone]);
     } else {
       setEvents((prev) => prev.map((e) => (e.id === evToPlace.id ? candidate : e)));
     }
@@ -279,7 +315,7 @@ loadFromStorage()
   const searchMatch = (e) => {
     const q = searchText.trim().toLowerCase();
     if (!q) return true;
-    return [e.title, e.contact, e.description, e.organization]
+    return [e.title, e.contact, e.phone, e.description, e.organization]
       .filter(Boolean)
       .some((v) => String(v).toLowerCase().includes(q));
   };
@@ -292,7 +328,10 @@ loadFromStorage()
   // ===== Auto-save to localStorage on changes =====
   useEffect(() => {
     try {
-      const payload = { startDate, events, categories,
+      const payload = {
+        startDate,
+        events,
+        categories,
         sidebarWidthPx,
         sidebarPos,
         dayColWidthPx,
@@ -301,12 +340,14 @@ loadFromStorage()
         filterOrg,
         filterConfirmed,
         searchText,
-      , showThumbs, showPricesOnExport };
+        showThumbs,
+        showPricesOnExport,
+      };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch (e) {
       console.warn("Failed to save schedule:", e);
     }
-  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, searchText]);
+  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, searchText, showThumbs, showPricesOnExport]);
 
 
   // Export
@@ -324,42 +365,55 @@ loadFromStorage()
   
   
   
-  const exportCSV = () => {
-    // כותרות בעברית
-    let headers = ["כותרת","תאריך","מס׳ יום","שעה","משך (דק׳)","קטגוריה","מחיר","תיאור","איש קשר","טלפון","ארגון","נעוץ","סופי"];
-    if (!showPricesOnExport) headers = headers.filter(h => h !== "מחיר");
+  
+const exportCSV = () => {
+  const includePrice = !!showPricesOnExport;
+  const headers = [
+    "כותרת","תאריך","מס׳ יום","שעה","משך (דק׳)","קטגוריה"
+  ];
+  if (includePrice) headers.push("מחיר");
+  headers.push("תיאור","איש קשר","טלפון","ארגון","נעוץ","סופי");
 
-    // הכנה לשורות
-    const rows = events.map((e) => {
-      const date = e.dayIndex != null ? days[e.dayIndex]?.dateKey || "" : "";
-      const catName = (catByKey[e.categoryKey]?.name) || "כללי";
-      const row = [
-  e.title ?? "",
-  date,
-  e.dayIndex ?? "",
-  e.time ?? "",
-  e.duration ?? "",
-  catName,
-  (typeof e.price === "number" ? e.price : ""),
-  e.description ?? "",
-  e.contact ?? "",
-  e.phone ?? "",
-  e.organization ?? "",
-  e.placed ? 1 : 0,
-  e.confirmed ? 1 : 0,
-];
-// הסרת מחיר אם ביקש להסתיר
-const idxPrice = headers.indexOf("מחיר");
-if (idxPrice === -1) { row.splice(6, 1); }
-return row;
-});
+  const rows = events.map((e) => {
+    const date = e.dayIndex != null ? days[e.dayIndex]?.dateKey || "" : "";
+    const catName = (catByKey[e.categoryKey]?.name) || "כללי";
+    const base = [
+      e.title ?? "",
+      date,
+      e.dayIndex ?? "",
+      e.time ?? "",
+      e.duration ?? "",
+      catName
+    ];
+    if (includePrice) base.push((typeof e.price === "number" || e.price) ? e.price : "");
+    base.push(
+      e.description ?? "",
+      e.contact ?? "",
+      e.phone ?? "",
+      e.organization ?? "",
+      e.placed ? "כן" : "לא",
+      e.confirmed ? "כן" : "לא"
+    );
+    return base;
+  });
 
-    // פונקציית ציטוט בטוחה ל-CSV (ללא רג'קסים)
-    const needsQuote = (s) => s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r");
-    const quoteCell = (val) => {
-      const s = String(val ?? "");
-      return needsQuote(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
+  const needsQuote = (s) => s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r");
+  const quoteCell = (val) => {
+    const s = String(val ?? "");
+    return needsQuote(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+
+  const csv = [headers, ...rows].map((arr) => arr.map(quoteCell).join(",")).join("\n");
+
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "schedule.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
 
     const csv = [headers, ...rows]
       .map((arr) => arr.map(quoteCell).join(","))
@@ -419,21 +473,6 @@ return row;
     };
     reader.readAsText(file, "utf-8");
   };
-
-  const printPDF = // Inject print CSS once
-  useEffect(() => {
-    if (!document.getElementById("print-hide-prices-css")) {
-      const style = document.createElement("style");
-      style.id = "print-hide-prices-css";
-      style.textContent = "@media print {.hide-prices-print .price-inline{display:none !important;}}";
-      document.head.appendChild(style);
-    }
-  }, []);
-
-  // Toggle body class for print hiding
-  useEffect(() => {
-    document.body.classList.toggle("hide-prices-print", !showPricesOnExport);
-  }, [showPricesOnExport]);
 
   const printPDF = () => window.print();
 
@@ -594,8 +633,16 @@ return row;
         </label>
 
         <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={printPDF}>הדפס / ייצא PDF</button>
-        <button className="bg-gray-700 text-white px-3 py-1 rounded" onClick={exportCSV}>ייצא CSV</button>
-        <button className="px-3 py-1 rounded border" title="נקה את הנתונים השמורים בדפדפן" onClick={() => { localStorage.removeItem(STORAGE_KEY); }}>נקה שמירה מקומית</button>
+<button className="bg-gray-700 text-white px-3 py-1 rounded" onClick={exportCSV}>ייצא CSV</button>
+<label className="text-sm flex items-center gap-2">
+  <input type="checkbox" checked={showThumbs} onChange={(e)=>setShowThumbs(e.target.checked)} />
+  להציג תמונות בפתקים
+</label>
+<label className="text-sm flex items-center gap-2">
+  <input type="checkbox" checked={showPricesOnExport} onChange={(e)=>setShowPricesOnExport(e.target.checked)} />
+  להציג מחירים ביצוא
+</label>
+<button className="px-3 py-1 rounded border" onClick={() => { localStorage.removeItem(STORAGE_KEY); }}>נקה שמירה מקומית</button>
         {conflictMsg && (
           <div className="text-xs text-red-700 bg-red-50 border border-red-200 px-2 py-1 rounded">{conflictMsg}</div>
         )}
@@ -622,6 +669,10 @@ return row;
                 <input type="number" min="0" step="0.01" placeholder="מחיר ₪" className="border p-1 mb-2 w-full" value={newEvent.price} onChange={(e) => setNewEvent({ ...newEvent, price: e.target.value })} />
               </div>
               <input type="text" placeholder="איש קשר" className="border p-1 mb-2 w-full" value={newEvent.contact} onChange={(e) => setNewEvent({ ...newEvent, contact: e.target.value })} />
+              <input type="tel" placeholder="טלפון" className="border p-1 mb-2 w-full" value={newEvent.phone}
+                     onChange={(e) => setNewEvent({ ...newEvent, phone: e.target.value })} />
+              <input type="file" accept="image/*" className="border p-1 mb-2 w-full"
+                     onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>setNewEvent(prev=>({...prev, imageDataUrl:String(r.result)})); r.readAsDataURL(f); }} />
               <input type="text" placeholder="ארגון" className="border p-1 mb-2 w-full" value={newEvent.organization} onChange={(e) => setNewEvent({ ...newEvent, organization: e.target.value })} />
               <textarea placeholder="תיאור" className="border p-1 mb-2 w-full h-16" value={newEvent.description} onChange={(e) => setNewEvent({ ...newEvent, description: e.target.value })} />
               <select className="border p-1 mb-2 w-full" value={newEvent.categoryKey} onChange={(e) => setNewEvent({ ...newEvent, categoryKey: e.target.value })}>
@@ -662,6 +713,9 @@ return row;
                           {e.confirmed ? "✓" : ""}
                         </button>
                       </div>
+                  {showThumbs && e.imageDataUrl && (
+                    <img src={e.imageDataUrl} alt="" className="absolute top-1 right-1 w-5 h-5 object-cover rounded pointer-events-none" />
+                  )}
     <div className="absolute top-1 left-1">
                         <button
                           type="button"
@@ -673,16 +727,12 @@ return row;
                           {e.confirmed ? "✓" : ""}
                         </button>
                       </div>
-    <div className="absolute top-1 right-1 flex gap-1">
+    <div className="absolute top-1 right-6 flex gap-1">
                     <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
                     <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
                   </div>
-{showThumbs && e.imageDataUrl ? (
-  <img src={e.imageDataUrl} alt="" className="absolute top-1 right-7 w-5 h-5 rounded object-cover shadow pointer-events-none" />
-) : null}
-
                   <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
-                  <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {typeof e.price === "number" || e.price ? `• ₪${e.price}` : ""}</div>
+                  <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' <span className="price-inline">{(typeof e.price === "number" || e.price) ? `• ₪${e.price}` : ""}</span></div>
                   {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
                 </div>
               ))}
@@ -705,6 +755,15 @@ return row;
 
                 <label className="block text-sm mb-1">איש קשר</label>
                 <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
+
+                <label className="block text-sm mb-1">טלפון</label>
+                <input type="tel" className="border p-1 w-full mb-2" value={selectedEvent.phone || ""}
+                  onChange={(e)=>updateSelectedEvent({ phone: e.target.value })} />
+
+                <label className="block text-sm mb-1">תמונה</label>
+                <input type="file" accept="image/*" className="border p-1 w-full mb-2"
+                   onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>updateSelectedEvent({ imageDataUrl:String(r.result) }); r.readAsDataURL(f); }} />
+                {selectedEvent.imageDataUrl && (<img src={selectedEvent.imageDataUrl} alt="" className="w-16 h-16 object-cover rounded mb-2" />)}
 
                 <label className="block text-sm mb-1">ארגון</label>
                 <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.organization || ""} onChange={(e) => updateSelectedEvent({ organization: e.target.value })} />
@@ -730,11 +789,7 @@ return row;
             {/* Export / Import */}
             <div className="p-3 rounded border">
               <div className="font-bold mb-2">ייצוא / ייבוא</div>
-              <label className="text-sm mb-2 flex items-center gap-2">
-  <input type="checkbox" checked={showPricesOnExport} onChange={(e) => setShowPricesOnExport(e.target.checked)} />
-  להציג מחירים ביצוא
-</label>
-<div className="grid grid-cols-2 gap-2 mb-2">
+              <div className="grid grid-cols-2 gap-2 mb-2">
                 <button className="bg-gray-800 text-white px-3 py-1 rounded w-full" onClick={exportJSON}>ייצא JSON</button>
                 <button className="bg-gray-700 text-white px-3 py-1 rounded w-full" onClick={exportCSV}>ייצא CSV</button>
               </div>
@@ -833,7 +888,7 @@ return row;
                 {getHolidayLabel(d.dateKey) && (
                   <div className="text-[11px] text-rose-700 mt-0.5">{getHolidayLabel(d.dateKey)}</div>
                 )}
-                <div className="text-xs mt-1">סה"כ: <span className="font-medium">₪{dayTotal(idx).toLocaleString()}</span></div>
+                <div className="text-xs mt-1">סה"כ: <span className="font-medium price-total">₪{dayTotal(idx).toLocaleString()}</span></div>
               </div>
             ))}
           </div>
@@ -906,7 +961,7 @@ return row;
                           {e.confirmed ? "✓" : ""}
                         </button>
                       </div>
-<div className="absolute top-1 right-1 flex gap-1">
+<div className="absolute top-1 right-6 flex gap-1">
                         <button title="עריכה" className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); setSelectedEventId(e.id); }}>✎</button>
                         <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                       </div>
@@ -915,7 +970,7 @@ return row;
                         <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[10rem]">ארגון: {e.organization}</div>
                       )}
                       <div className="absolute bottom-1 right-2 text-[10px] opacity-85">
-                        {e.time} • {e.duration} דק' {typeof e.price === "number" && e.price > 0 ? <span className="price-inline">• ₪{e.price}</span> : ""}
+                        {e.time} • {e.duration} דק' <span className="price-inline">{(typeof e.price === "number" && e.price > 0) ? `• ₪${e.price}` : ""}</span>
                       </div>
                       {/* Resize handle */}
                       <div
@@ -1005,7 +1060,7 @@ return row;
                           {e.confirmed ? "✓" : ""}
                         </button>
                       </div>
-<div className="absolute top-1 right-1 flex gap-1">
+<div className="absolute top-1 right-6 flex gap-1">
                           <button title="עריכה" className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); setSelectedEventId(e.id); }}>✎</button>
                           <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                         </div>
@@ -1014,7 +1069,7 @@ return row;
                           <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[12rem]">ארגון: {e.organization}</div>
                         )}
                         <div className="absolute bottom-1 right-2 text-[10px] opacity-85">
-                          {e.time} • {e.duration} דק' {typeof e.price === "number" && e.price > 0 ? `• ₪${e.price}` : ""}
+                          {e.time} • {e.duration} דק' <span className="price-inline">{(typeof e.price === "number" && e.price > 0) ? `• ₪${e.price}` : ""}</span>
                         </div>
                         {/* Resize handle */}
                         <div
@@ -1027,7 +1082,7 @@ return row;
                     ))}
                 </div>
               </div>
-              <div className="text-right mt-3 font-medium">סה"כ יום: ₪{dayTotal(zoomDay).toLocaleString()}</div>
+              <div className="text-right mt-3 font-medium">סה"כ יום: <span className="price-total">₪{dayTotal(zoomDay).toLocaleString()}</span></div>
             </div>
           </div>
         </div>
