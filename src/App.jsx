@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+// xlsx is ~500KB — loaded on demand (only when the template/import buttons are used)
+// instead of in the main bundle, via dynamic import() inside the functions that need it.
 
 /* =====================
    Constants & Helpers
@@ -31,6 +33,24 @@ const DEFAULT_CATEGORIES = [
 ];
 
 const STORAGE_KEY = "interactiveScheduler_v2";
+
+const AUDIENCES = [
+  { key: "children", name: "ילדים", color: "#38bdf8" },
+  { key: "families", name: "משפחות", color: "#fb923c" },
+  { key: "adults", name: "מבוגרים", color: "#a3a3a3" },
+];
+const audienceLabel = (key) => AUDIENCES.find((a) => a.key === key)?.name || key;
+
+// Tailwind's JIT scanner needs full literal class names in the source, so this can't be
+// built with a template string like `grid-cols-${n}`.
+const GRID_COLS_CLASS = { 1: "grid-cols-1", 2: "grid-cols-2", 3: "grid-cols-3" };
+
+const PRICE_GROUPS = [
+  { key: "none", label: "ללא מחיר", test: (p) => !p || p <= 0 },
+  { key: "low", label: "עד 300 ₪", test: (p) => p > 0 && p <= 300 },
+  { key: "mid", label: "301–800 ₪", test: (p) => p > 300 && p <= 800 },
+  { key: "high", label: "מעל 800 ₪", test: (p) => p > 800 },
+];
 
 
 const SHOW_PRICES_KEY = "suka_showPrices";
@@ -102,9 +122,180 @@ const HOLIDAYS_IL = {
 };
 const getHolidayLabel = (dateKey) => HOLIDAYS_IL[dateKey] || null;
 
+// Column names for the schedule import/template spreadsheet — single source of truth so the
+// template writer and the row parser can never drift apart on header text.
+const IMPORT_COL = {
+  title: "כותרת",
+  date: "תאריך (DD/MM/YYYY)",
+  time: "שעה (HH:MM)",
+  duration: "משך בדקות",
+  category: "קטגוריה",
+  audiences: "קהל יעד",
+  cost1Label: "רכיב עלות 1", cost1Amount: "סכום 1",
+  cost2Label: "רכיב עלות 2", cost2Amount: "סכום 2",
+  cost3Label: "רכיב עלות 3", cost3Amount: "סכום 3",
+  description: "תיאור",
+  contact: "איש קשר",
+  phone: "טלפון",
+  organization: "ארגון",
+  confirmed: "סופי (כן/לא)",
+};
+
+// Accepts either a real Excel date cell (parsed as a JS Date when the workbook is read with
+// cellDates:true) or a plain DD/MM/YYYY-ish text string; returns a "YYYY-MM-DD" key matching
+// the `days` array, or null if unparseable.
+const parseImportDate = (v) => {
+  if (v instanceof Date && !isNaN(v.getTime())) {
+    const y = v.getFullYear();
+    const m = String(v.getMonth() + 1).padStart(2, "0");
+    const d = String(v.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  const str = String(v || "").trim();
+  if (!str) return null;
+  const m = str.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+  if (!m) return null;
+  let [, d, mo, y] = m;
+  if (y.length === 2) y = `20${y}`;
+  return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+};
+
+function AudienceBadges({ audiences }) {
+  if (!Array.isArray(audiences) || audiences.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1 mt-1">
+      {audiences.map((k) => (
+        <span key={k} className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/70 border border-gray-400">
+          {audienceLabel(k)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const CHART_PALETTE = ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#f472b6", "#38bdf8", "#facc15", "#4ade80", "#fb923c"];
+const colorForIndex = (i) => CHART_PALETTE[i % CHART_PALETTE.length];
+
+// data: [{ label, value, color }] — renders a CSS conic-gradient pie (no charting library needed)
+function PieChart({ data }) {
+  const clean = data.filter((d) => d.value > 0);
+  const total = clean.reduce((s, d) => s + d.value, 0);
+  if (total <= 0) {
+    return <div className="text-xs text-gray-500">אין נתונים להצגה</div>;
+  }
+  let cursor = 0;
+  const stops = clean
+    .map((d) => {
+      const start = cursor;
+      cursor += (d.value / total) * 100;
+      return `${d.color} ${start}% ${cursor}%`;
+    })
+    .join(", ");
+
+  return (
+    <div className="flex items-center gap-4">
+      <div
+        className="rounded-full shrink-0"
+        style={{ width: 120, height: 120, background: `conic-gradient(${stops})` }}
+      />
+      <ul className="text-xs space-y-1 flex-1 min-w-0">
+        {clean.map((d) => (
+          <li key={d.label} className="flex items-center gap-2">
+            <span className="inline-block w-3 h-3 rounded shrink-0" style={{ background: d.color }} />
+            <span className="flex-1 truncate" title={d.label}>{d.label}</span>
+            <span className="text-gray-600 shrink-0">{Math.round((d.value / total) * 100)}%</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function AudienceCheckboxes({ selected, onChange }) {
+  const list = Array.isArray(selected) ? selected : [];
+  return (
+    <div className="flex flex-wrap gap-3">
+      {AUDIENCES.map((a) => (
+        <label key={a.key} className="text-xs flex items-center gap-1">
+          <input
+            type="checkbox"
+            checked={list.includes(a.key)}
+            onChange={(e) => {
+              const set = new Set(list);
+              if (e.target.checked) set.add(a.key);
+              else set.delete(a.key);
+              onChange(Array.from(set));
+            }}
+          />
+          {a.name}
+        </label>
+      ))}
+    </div>
+  );
+}
+
 
 const safeNumber = (v) => (v === "" || v == null || isNaN(Number(v)) ? "" : Number(v));
 const slotIndex = (time) => timeSlots.indexOf(time);
+// Pure slot-overlap check, reused by both hasConflict (against live state) and the
+// schedule importer (which also needs to check newly-imported rows against each other).
+const timeRangeConflicts = (candidate, list) => {
+  const startIdx = slotIndex(candidate.time);
+  const blocks = Math.ceil(candidate.duration / SLOT_MIN);
+  const endIdx = startIdx + blocks;
+  return list.some((e) => {
+    if (e.id === candidate.id) return false;
+    if (!e.placed || e.dayIndex !== candidate.dayIndex) return false;
+    const s2 = slotIndex(e.time);
+    const e2 = s2 + Math.ceil(e.duration / SLOT_MIN);
+    return startIdx < e2 && s2 < endIdx;
+  });
+};
+// Total cost of an event: sum of its cost components, falling back to the legacy single `price`
+// field for events saved before cost items existed.
+const VAT_RATE = 0.18; // Israel standard VAT — update here if the rate changes
+
+// Safely evaluate a cost item's amount field, which may be a plain number or a simple
+// arithmetic formula (e.g. "3000*1.18", optionally prefixed with "="). Only digits,
+// whitespace and + - * / ( ) . are allowed — anything else is rejected instead of
+// being passed to eval()/Function() unchecked.
+const evalFormula = (raw) => {
+  if (raw == null) return 0;
+  let expr = String(raw).trim();
+  if (expr === "") return 0;
+  if (expr.startsWith("=")) expr = expr.slice(1).trim();
+  if (!/^[0-9+\-*/(). \s]*$/.test(expr)) return NaN;
+  try {
+    const result = Function(`"use strict"; return (${expr || 0});`)();
+    return typeof result === "number" && isFinite(result) ? result : NaN;
+  } catch {
+    return NaN;
+  }
+};
+
+// Resolves one cost item to its final ₪ amount: the formula result, plus VAT if the
+// item's "כולל מע\"מ+" checkbox is on.
+const resolveAmount = (item) => {
+  const base = evalFormula(item?.amount);
+  if (isNaN(base)) return 0;
+  return item?.vat ? base * (1 + VAT_RATE) : base;
+};
+
+const eventTotal = (e) => {
+  if (Array.isArray(e.costItems) && e.costItems.length > 0) {
+    return e.costItems.reduce((sum, ci) => sum + resolveAmount(ci), 0);
+  }
+  return typeof e.price === "number" ? e.price : 0;
+};
+// One-time upgrade for events saved before cost items existed: turn a legacy single `price`
+// into a proper cost line item so it's visible/editable in the cost breakdown editor.
+const migrateEvent = (e) => {
+  if (Array.isArray(e.costItems) && e.costItems.length > 0) return e;
+  if (typeof e.price === "number" && e.price > 0) {
+    return { ...e, costItems: [{ id: `${e.id}-legacy-price`, label: "מחיר", amount: String(e.price), vat: false }] };
+  }
+  return Array.isArray(e.costItems) ? e : { ...e, costItems: [] };
+};
 const normalizeOrg = (s) => (s && s.trim()) ? s.trim() : "ללא ארגון";
 const durationLabel = (m) => {
   if (m % 60 === 0) {
@@ -113,6 +304,57 @@ const durationLabel = (m) => {
   }
   return `${Math.floor(m / 60)}:${(m % 60).toString().padStart(2, "0")} ש"`;
 };
+
+function CostItemsEditor({ items, onChange }) {
+  const list = Array.isArray(items) ? items : [];
+  const total = list.reduce((sum, ci) => sum + resolveAmount(ci), 0);
+
+  const updateItem = (id, patch) => onChange(list.map((ci) => (ci.id === id ? { ...ci, ...patch } : ci)));
+  const removeItem = (id) => onChange(list.filter((ci) => ci.id !== id));
+  const addItem = () => onChange([...list, { id: Date.now() + Math.random(), label: "", amount: "", vat: false }]);
+
+  return (
+    <div>
+      {list.map((ci) => {
+        const resolved = resolveAmount(ci);
+        const invalid = isNaN(evalFormula(ci.amount));
+        return (
+          <div key={ci.id} className="border rounded p-1.5 mb-1.5">
+            <div className="flex items-center gap-1 mb-1">
+              <input
+                type="text"
+                placeholder="רכיב (למשל: אמן)"
+                className="border p-1 flex-1 text-sm"
+                value={ci.label}
+                onChange={(e) => updateItem(ci.id, { label: e.target.value })}
+              />
+              <button type="button" className="text-red-600 text-xs px-1" onClick={() => removeItem(ci.id)} title="הסר רכיב">✕</button>
+            </div>
+            <div className="flex items-center gap-1">
+              <input
+                type="text"
+                placeholder="1500 או =3000*1.18"
+                className={`border p-1 flex-1 text-sm ${invalid ? "border-red-500" : ""}`}
+                value={ci.amount}
+                onChange={(e) => updateItem(ci.id, { amount: e.target.value })}
+                dir="ltr"
+              />
+              <label className="text-[11px] flex items-center gap-1 whitespace-nowrap" title={`מוסיף ${Math.round(VAT_RATE * 100)}% על הסכום שהוזן`}>
+                <input type="checkbox" checked={!!ci.vat} onChange={(e) => updateItem(ci.id, { vat: e.target.checked })} />
+                {`+ מע"מ (${Math.round(VAT_RATE * 100)}%)`}
+              </label>
+            </div>
+            <div className={`text-[11px] mt-0.5 ${invalid ? "text-red-600" : "text-gray-600"}`}>
+              {invalid ? "נוסחה לא תקינה" : `= ₪${resolved.toLocaleString()}`}
+            </div>
+          </div>
+        );
+      })}
+      <button type="button" className="text-xs border rounded px-2 py-1 mb-1" onClick={addItem}>+ הוסף רכיב</button>
+      <div className="text-sm font-semibold mt-1">סה"כ: ₪{total.toLocaleString()}</div>
+    </div>
+  );
+}
 
 /** Calculate time from Y position inside day column */
 const timeFromClientY = (container, clientY) => {
@@ -132,8 +374,9 @@ export default function InteractiveSchedule() {
     confirmed: false,
     title: "",
     duration: 30,
-    price: "",
+    costItems: [],
     categoryKey: "general",
+    audiences: [],
     description: "",
     contact: "",
     phone: "",
@@ -153,17 +396,31 @@ export default function InteractiveSchedule() {
   const [filterCategory, setFilterCategory] = useState("all");
   const [filterOrg, setFilterOrg] = useState("all");
   const [filterConfirmed, setFilterConfirmed] = useState("all"); // all | yes | no
+  const [filterAudience, setFilterAudience] = useState("all");
+  const [sidebarTab, setSidebarTab] = useState("notes"); // "notes" | "library"
+  const [libraryGroupBy, setLibraryGroupBy] = useState("category"); // "category" | "audience" | "price"
   const [zoomDay, setZoomDay] = useState(null); // number | null
   const [sumPlacedOnly, setSumPlacedOnly] = useState(true);
   const [searchText, setSearchText] = useState("");
   const [dayColWidthPx, setDayColWidthPx] = useState(176); // adjustable day column width
   const [sidebarWidthPx, setSidebarWidthPx] = useState(320); // resizable sidebar
   const [sidebarPos, setSidebarPos] = useState("left"); // "left" | "right"
+  const [notesBankOpen, setNotesBankOpen] = useState(true);
+  const [notesBankWidthPx, setNotesBankWidthPx] = useState(320);
+  const [notesBankColumns, setNotesBankColumns] = useState(1); // 1 | 2 | 3
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showTotalsModal, setShowTotalsModal] = useState(false);
+  const [showCategoriesModal, setShowCategoriesModal] = useState(false);
 
   // resizer refs (sidebar)
   const isResizingSidebar = useRef(false);
   const startX = useRef(0);
   const startW = useRef(0);
+
+  // resizer refs (notes bank)
+  const isResizingNotesBank = useRef(false);
+  const notesStartX = useRef(0);
+  const notesStartW = useRef(0);
 
   // ===== Resize event (change duration by dragging bottom edge) =====
   const [resizingInfo, setResizingInfo] = useState(null); // { id, startY, originalBlocks, startIdx, dayIndex }
@@ -245,15 +502,19 @@ export default function InteractiveSchedule() {
       const data = JSON.parse(raw);
       if (data && typeof data === "object") {
         if (typeof data.startDate === "string") setStartDate(data.startDate);
-        if (Array.isArray(data.events)) setEvents(data.events);
+        if (Array.isArray(data.events)) setEvents(data.events.map(migrateEvent));
         if (Array.isArray(data.categories)) setCategories(data.categories);
         if (typeof data.sidebarWidthPx === "number") setSidebarWidthPx(data.sidebarWidthPx);
         if (data.sidebarPos === "left" || data.sidebarPos === "right") setSidebarPos(data.sidebarPos);
+        if (typeof data.notesBankOpen === "boolean") setNotesBankOpen(data.notesBankOpen);
+        if (typeof data.notesBankWidthPx === "number") setNotesBankWidthPx(data.notesBankWidthPx);
+        if ([1, 2, 3].includes(data.notesBankColumns)) setNotesBankColumns(data.notesBankColumns);
         if (typeof data.dayColWidthPx === "number") setDayColWidthPx(data.dayColWidthPx);
         if (typeof data.sumPlacedOnly === "boolean") setSumPlacedOnly(data.sumPlacedOnly);
         if (typeof data.filterCategory === "string") setFilterCategory(data.filterCategory);
         if (typeof data.filterOrg === "string") setFilterOrg(data.filterOrg);
         if (typeof data.filterConfirmed === "string") setFilterConfirmed(data.filterConfirmed);
+        if (typeof data.filterAudience === "string") setFilterAudience(data.filterAudience);
         if (typeof data.searchText === "string") setSearchText(data.searchText);
       }
     } catch (e) {
@@ -287,16 +548,7 @@ export default function InteractiveSchedule() {
 
   const hasConflict = (candidate) => {
     if (candidate.dayIndex == null || !candidate.time) return false;
-    const startIdx = slotIndex(candidate.time);
-    const blocks = Math.ceil(candidate.duration / SLOT_MIN);
-    const endIdx = startIdx + blocks; // exclusive
-    return events.some((e) => {
-      if (e.id === candidate.id) return false;
-      if (!e.placed || e.dayIndex !== candidate.dayIndex) return false;
-      const s2 = slotIndex(e.time);
-      const e2 = s2 + Math.ceil(e.duration / SLOT_MIN);
-      return startIdx < e2 && s2 < endIdx;
-    });
+    return timeRangeConflicts(candidate, events);
   };
 
   const addEvent = () => {
@@ -304,14 +556,15 @@ export default function InteractiveSchedule() {
     const id = Date.now() + Math.random();
     setEvents((prev) => [
       ...prev,
-      { ...newEvent, id, placed: false, price: safeNumber(newEvent.price), confirmed: !!newEvent.confirmed },
+      { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed },
     ]);
     setNewEvent({
       confirmed: false,
       title: "",
       duration: 30,
-      price: "",
+      costItems: [],
       categoryKey: newEvent.categoryKey,
+      audiences: [],
       description: "",
       contact: "",
       phone: "",
@@ -364,7 +617,42 @@ export default function InteractiveSchedule() {
   const matchCategory = (e) => filterCategory === "all" || e.categoryKey === filterCategory;
   const matchOrg = (e) => filterOrg === "all" || normalizeOrg(e.organization) === filterOrg;
   const matchConfirmed = (e) => filterConfirmed === "all" || (filterConfirmed === "yes" && !!e.confirmed) || (filterConfirmed === "no" && !e.confirmed);
-  const visibleEventsFilter = (e) => matchCategory(e) && matchOrg(e) && matchConfirmed(e) && searchMatch(e);
+  const matchAudience = (e) => filterAudience === "all" || (Array.isArray(e.audiences) && e.audiences.includes(filterAudience));
+  const visibleEventsFilter = (e) => matchCategory(e) && matchOrg(e) && matchConfirmed(e) && matchAudience(e) && searchMatch(e);
+
+  // Library view: every event (placed + unplaced) that passes the current filters, grouped by category/audience/price
+  const buildLibraryGroups = () => {
+    const filtered = events.filter(visibleEventsFilter);
+    if (libraryGroupBy === "audience") {
+      const groups = AUDIENCES.map((a) => ({
+        key: a.key,
+        label: a.name,
+        color: a.color,
+        items: filtered.filter((e) => Array.isArray(e.audiences) && e.audiences.includes(a.key)),
+      }));
+      groups.push({
+        key: "none",
+        label: "ללא קהל מוגדר",
+        color: "#d1d5db",
+        items: filtered.filter((e) => !Array.isArray(e.audiences) || e.audiences.length === 0),
+      });
+      return groups;
+    }
+    if (libraryGroupBy === "price") {
+      return PRICE_GROUPS.map((g) => ({
+        key: g.key,
+        label: g.label,
+        color: "#d1d5db",
+        items: filtered.filter((e) => g.test(eventTotal(e))),
+      }));
+    }
+    return categories.map((c) => ({
+      key: c.key,
+      label: c.name,
+      color: c.color,
+      items: filtered.filter((e) => (e.categoryKey || "general") === c.key),
+    }));
+  };
 
 
   // ===== Auto-save to localStorage on changes =====
@@ -376,18 +664,22 @@ export default function InteractiveSchedule() {
         categories,
         sidebarWidthPx,
         sidebarPos,
+        notesBankOpen,
+        notesBankWidthPx,
+        notesBankColumns,
         dayColWidthPx,
         sumPlacedOnly,
         filterCategory,
         filterOrg,
         filterConfirmed,
+        filterAudience,
         searchText,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch (e) {
       console.warn("Failed to save schedule:", e);
     }
-  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, searchText]);
+  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, notesBankOpen, notesBankWidthPx, notesBankColumns, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, filterAudience, searchText]);
 
 
   // Export
@@ -408,7 +700,7 @@ export default function InteractiveSchedule() {
   const exportCSV = () => {
     // כותרות בעברית
     const headers = [
-      "כותרת","תאריך","מס׳ יום","שעה","משך (דק׳)","קטגוריה","מחיר",
+      "כותרת","תאריך","מס׳ יום","שעה","משך (דק׳)","קטגוריה","קהל יעד","עלות כוללת","פירוט עלות",
       "תיאור","איש קשר","טלפון","ארגון","נעוץ","סופי"
     ];
 
@@ -416,6 +708,11 @@ export default function InteractiveSchedule() {
     const rows = events.map((e) => {
       const date = e.dayIndex != null ? days[e.dayIndex]?.dateKey || "" : "";
       const catName = (catByKey[e.categoryKey]?.name) || "כללי";
+      const audienceNames = (Array.isArray(e.audiences) ? e.audiences : []).map(audienceLabel).join("; ");
+      const costBreakdown = (Array.isArray(e.costItems) ? e.costItems : [])
+        .filter((ci) => ci.label || ci.amount)
+        .map((ci) => `${ci.label || "רכיב"}: ₪${resolveAmount(ci)}${ci.vat ? " (כולל מע\"מ)" : ""}`)
+        .join("; ");
       return [
         e.title ?? "",
         date,
@@ -423,7 +720,9 @@ export default function InteractiveSchedule() {
         e.time ?? "",
         e.duration ?? "",
         catName,
-        (typeof e.price === "number" ? e.price : ""),
+        audienceNames,
+        eventTotal(e),
+        costBreakdown,
         e.description ?? "",
         e.contact ?? "",
         (e.contactPhone || e.phone || ""),
@@ -461,7 +760,7 @@ export default function InteractiveSchedule() {
       if (data && Array.isArray(data.events) && typeof data.startDate === "string") {
         setStartDate(data.startDate);
         if (Array.isArray(data.categories)) setCategories(data.categories);
-        setEvents(data.events);
+        setEvents(data.events.map(migrateEvent));
         setConflictMsg(`ייבוא הושלם: נטענו ${data.events.length} אירועים.`);
       } else {
         setConflictMsg("פורמט ייבוא לא תקין.");
@@ -482,7 +781,7 @@ export default function InteractiveSchedule() {
         if (data && Array.isArray(data.events) && typeof data.startDate === "string") {
           setStartDate(data.startDate);
           if (Array.isArray(data.categories)) setCategories(data.categories);
-          setEvents(data.events);
+          setEvents(data.events.map(migrateEvent));
           setConflictMsg(`ייבוא מהקובץ הצליח: ${data.events.length} אירועים נטענו.`);
         } else {
           setConflictMsg("קובץ JSON לא תואם לפורמט צפוי.");
@@ -499,19 +798,146 @@ export default function InteractiveSchedule() {
     reader.readAsText(file, "utf-8");
   };
 
+  // Import (Excel / CSV schedule template) — adds new events, does not replace the current schedule
+  const downloadScheduleTemplate = async () => {
+    const XLSX = await import("xlsx");
+    const headers = Object.values(IMPORT_COL);
+    const example = [
+      "הופעת זמר", "07/10/2026", "20:00", 90, "מוזיקה", "משפחות;מבוגרים",
+      "אמן", 3000, "הגברה", 500, "", "",
+      "ערב שירה בסוכה", "ישראל ישראלי", "050-1234567", "עמותת דוגמה", "לא",
+    ];
+    const ws = XLSX.utils.aoa_to_sheet([headers, example]);
+    ws["!cols"] = headers.map(() => ({ wch: 18 }));
+
+    const infoWs = XLSX.utils.aoa_to_sheet([
+      ["הוראות מילוי"],
+      ["- שורה 1 היא כותרות העמודות, אין לשנות אותן."],
+      ["- שורה 2 היא דוגמה — אפשר למחוק אותה ולהזין נתונים מתחת לכותרות."],
+      ["- תאריך ושעה הם אופציונליים: אם ריקים, האירוע ייכנס כפתק ממתין (לא ממוקם בלוח)."],
+      ["- יש להזין תאריך ושעה כטקסט רגיל בפורמט המוצג בדוגמה, לא כתאריך/שעה מעוצבים של אקסל."],
+      ["- שעה חייבת להיות אחת מחצאי השעה שבין 09:30 ל-23:00 (למשל 20:00 או 20:30)."],
+      [`- קהל יעד: אפשר לרשום כמה קהלים מופרדים ב-; מתוך: ${AUDIENCES.map((a) => a.name).join(", ")}`],
+      ["- ניתן להזין עד 3 רכיבי עלות; אפשר להוסיף עוד רכיבים בתוך האפליקציה אחרי הייבוא."],
+      [],
+      ["קטגוריות זמינות כרגע (יש להעתיק בדיוק, אחרת האירוע יסומן \"כללי\"):"],
+      ...categories.map((c) => [c.name]),
+    ]);
+    infoWs["!cols"] = [{ wch: 70 }];
+
+    const wb = XLSX.utils.book_new();
+    wb.Workbook = { Views: [{ RTL: true }] };
+    XLSX.utils.book_append_sheet(wb, ws, "לוח פעילויות");
+    XLSX.utils.book_append_sheet(wb, infoWs, "הוראות וקטגוריות");
+    XLSX.writeFile(wb, "תבנית_ייבוא_פעילויות.xlsx");
+  };
+
+  const importRowsAsEvents = (rows) => {
+    const summary = { added: 0, placed: 0, unplaced: 0, unknownCategory: 0 };
+    const newEvents = [];
+    rows
+      .filter((r) => String(r[IMPORT_COL.title] || "").trim())
+      .forEach((r, idx) => {
+        const title = String(r[IMPORT_COL.title] || "").trim();
+        const durationRaw = Number(r[IMPORT_COL.duration]);
+        const duration = durationRaw > 0 ? Math.max(30, Math.round(durationRaw / 30) * 30) : 30;
+
+        const catNameRaw = String(r[IMPORT_COL.category] || "").trim();
+        const matchedCat = categories.find((c) => c.name === catNameRaw);
+        if (catNameRaw && !matchedCat) summary.unknownCategory++;
+        const categoryKey = matchedCat ? matchedCat.key : "general";
+
+        const audiencesRaw = String(r[IMPORT_COL.audiences] || "").split(/[;,]/).map((s) => s.trim()).filter(Boolean);
+        const audiences = AUDIENCES.filter((a) => audiencesRaw.includes(a.name)).map((a) => a.key);
+
+        const costItems = [];
+        [1, 2, 3].forEach((i) => {
+          const label = String(r[IMPORT_COL[`cost${i}Label`]] || "").trim();
+          const amount = String(r[IMPORT_COL[`cost${i}Amount`]] || "").trim();
+          if (label || amount) costItems.push({ id: `imp-${Date.now()}-${idx}-${i}`, label, amount, vat: false });
+        });
+
+        const dateKey = parseImportDate(r[IMPORT_COL.date]);
+        const dayIndex = dateKey ? days.findIndex((d) => d.dateKey === dateKey) : -1;
+        const time = String(r[IMPORT_COL.time] || "").trim();
+        const validTime = timeSlots.includes(time);
+
+        const base = {
+          id: Date.now() + Math.random() + idx,
+          title,
+          duration,
+          categoryKey,
+          audiences,
+          costItems,
+          description: String(r[IMPORT_COL.description] || ""),
+          contact: String(r[IMPORT_COL.contact] || ""),
+          contactPhone: String(r[IMPORT_COL.phone] || ""),
+          organization: String(r[IMPORT_COL.organization] || ""),
+          confirmed: /^כן$/.test(String(r[IMPORT_COL.confirmed] || "").trim()),
+        };
+
+        if (dayIndex >= 0 && validTime) {
+          const candidate = { ...base, placed: true, dayIndex, time };
+          if (!timeRangeConflicts(candidate, [...events, ...newEvents])) {
+            summary.placed++;
+            newEvents.push(candidate);
+            return;
+          }
+        }
+        summary.unplaced++;
+        newEvents.push({ ...base, placed: false });
+      });
+    summary.added = newEvents.length;
+    return { newEvents, summary };
+  };
+
+  const importScheduleFile = async (file) => {
+    try {
+      const XLSX = await import("xlsx");
+      const isCsv = /\.csv$/i.test(file.name);
+      // raw:true for CSV — otherwise SheetJS auto-converts date/time-looking text (e.g.
+      // "07/10/2026", "20:00") into Excel serial numbers, which parseImportDate can't read.
+      const workbook = isCsv
+        ? XLSX.read(await file.text(), { type: "string", raw: true })
+        : XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: true });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+      const { newEvents, summary } = importRowsAsEvents(rows);
+      if (newEvents.length === 0) {
+        setConflictMsg("לא נמצאו שורות עם כותרת בקובץ שיובא.");
+        return;
+      }
+      setEvents((prev) => [...prev, ...newEvents]);
+      setConflictMsg(
+        `יובאו ${summary.added} אירועים (${summary.placed} מוקמו בלוח, ${summary.unplaced} נוספו כפתקים ממתינים)` +
+        (summary.unknownCategory ? `, ${summary.unknownCategory} עם קטגוריה לא מזוהה (סומנו "כללי")` : "") + "."
+      );
+    } catch (err) {
+      console.error(err);
+      setConflictMsg("שגיאה בקריאת קובץ האקסל/CSV. יש לוודא שהשתמשת בתבנית שסופקה.");
+    }
+  };
+
+  const onImportScheduleFile = (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    importScheduleFile(file);
+    ev.target.value = "";
+  };
+
   const printPDF = () => window.print();
 
   // totals
   const dayTotal = (dayIndex) =>
     events
       .filter((e) => (sumPlacedOnly ? e.placed : true) && e.dayIndex === dayIndex)
-      .reduce((acc, e) => acc + (typeof e.price === "number" ? e.price : 0), 0);
+      .reduce((acc, e) => acc + eventTotal(e), 0);
 
   const categoryTotals = useMemo(() => {
     const map = Object.fromEntries(categories.map((c) => [c.key, 0]));
     events.forEach((e) => {
       if (!sumPlacedOnly || e.placed) {
-        const p = typeof e.price === "number" ? e.price : 0;
+        const p = eventTotal(e);
         const key = e.categoryKey ?? "general";
         map[key] = (map[key] || 0) + p;
       }
@@ -523,7 +949,7 @@ export default function InteractiveSchedule() {
     const map = {};
     events.forEach((e) => {
       if (!sumPlacedOnly || e.placed) {
-        const p = typeof e.price === "number" ? e.price : 0;
+        const p = eventTotal(e);
         const org = normalizeOrg(e.organization);
         map[org] = (map[org] || 0) + p;
       }
@@ -539,7 +965,6 @@ export default function InteractiveSchedule() {
   const updateSelectedEvent = (patch) => {
     if (!selectedEvent) return;
     const candidate = { ...selectedEvent, ...patch };
-    if (candidate.price !== undefined) candidate.price = safeNumber(candidate.price);
     if (candidate.placed && hasConflict(candidate)) {
       setConflictMsg("לא ניתן לעדכן – יש חפיפה עם אירוע אחר.");
       return;
@@ -586,6 +1011,36 @@ export default function InteractiveSchedule() {
     };
   }, [sidebarPos, sidebarWidthPx]);
 
+  // notes bank resizer handlers — the panel sits at the far right of the layout,
+  // so dragging its left-edge handle left (negative dx) grows it
+  const onNotesResizeStart = (e) => {
+    isResizingNotesBank.current = true;
+    notesStartX.current = e.clientX;
+    notesStartW.current = notesBankWidthPx;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+  };
+  useEffect(() => {
+    const onMove = (e) => {
+      if (!isResizingNotesBank.current) return;
+      const dx = e.clientX - notesStartX.current;
+      const newW = Math.max(240, Math.min(1100, notesStartW.current - dx));
+      setNotesBankWidthPx(newW);
+    };
+    const onUp = () => {
+      if (!isResizingNotesBank.current) return;
+      isResizingNotesBank.current = false;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [notesBankWidthPx]);
+
   /* =====================
      UI
      ===================== */
@@ -626,6 +1081,15 @@ export default function InteractiveSchedule() {
             <option value="all">הכל</option>
             <option value="yes">סופיים</option>
             <option value="no">לא סופיים</option>
+          </select>
+        </label>
+        <label className="text-sm flex items-center gap-2">
+          קהל יעד:
+          <select className="border p-1" value={filterAudience} onChange={(e) => setFilterAudience(e.target.value)}>
+            <option value="all">הכל</option>
+            {AUDIENCES.map((a) => (
+              <option key={a.key} value={a.key}>{a.name}</option>
+            ))}
           </select>
         </label>
         <label className="text-sm flex items-center gap-2">
@@ -682,111 +1146,10 @@ export default function InteractiveSchedule() {
           dir="rtl"
         >
           <div className="sticky top-4 space-y-4 p-2">
-            <div>
-              <h2 className="font-bold mb-2">פתקים של אירועים</h2>
-              <input type="text" placeholder="שם האירוע" className="border p-1 mb-2 w-full" value={newEvent.title} onChange={(e) => setNewEvent({ ...newEvent, title: e.target.value })} />
-              <div className="grid grid-cols-2 gap-2">
-                <select className="border p-1 mb-2 w-full" value={newEvent.duration} onChange={(e) => setNewEvent({ ...newEvent, duration: Number(e.target.value) })}>
-                  {DURATIONS.map((m) => (
-                    <option key={m} value={m}>{durationLabel(m)}</option>
-                  ))}
-                </select>
-                <input type="number" min="0" step="0.01" placeholder="מחיר ₪" className="border p-1 mb-2 w-full" value={newEvent.price} onChange={(e) => setNewEvent({ ...newEvent, price: e.target.value })} />
-              </div>
-              <input type="text" placeholder="איש קשר" className="border p-1 mb-2 w-full" value={newEvent.contact} onChange={(e) => setNewEvent({ ...newEvent, contact: e.target.value })} />
-              <input type="tel" placeholder="טלפון איש קשר" className="border p-1 mb-2 w-full" value={newEvent.contactPhone || ""} onChange={(e) => setNewEvent({ ...newEvent, contactPhone: e.target.value })} />
-              <input type="text" placeholder="ארגון" className="border p-1 mb-2 w-full" value={newEvent.organization} onChange={(e) => setNewEvent({ ...newEvent, organization: e.target.value })} />
-              <textarea placeholder="תיאור" className="border p-1 mb-2 w-full h-16" value={newEvent.description} onChange={(e) => setNewEvent({ ...newEvent, description: e.target.value })} />
-              <select className="border p-1 mb-2 w-full" value={newEvent.categoryKey} onChange={(e) => setNewEvent({ ...newEvent, categoryKey: e.target.value })}>
-                {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
-              </select>
-              <button className="bg-green-600 text-white px-3 py-1 rounded w-full" onClick={addEvent}>הוסף פתק</button>
-
-              <div className="flex items-center justify-between mt-4">
-                <h3 className="font-bold">פתקים שלא ננעצו</h3>
-              </div>
-              {events.filter((e) => !e.placed && visibleEventsFilter(e)).length === 0 && (
-                <div className="text-xs text-gray-500">אין פתקים ממתינים (או שלא נמצאו בחיפוש/פילטרים)</div>
-              )}
-              {events.filter((e) => !e.placed).filter(visibleEventsFilter).map((e) => (
-                <div
-                  key={e.id}
-                  className="p-2 rounded mb-2 relative text-right"
-                  style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
-                  draggable
-                  onDragStart={(ev) => {
-                    ev.dataTransfer.setData("text/event-id", String(e.id));
-                    ev.dataTransfer.effectAllowed = "copyMove";
-                    setDraggedEventId(e.id);
-                  }}
-                  onDragEnd={() => setDraggedEventId(null)}
-                  dir="rtl"
-                >
-                  
-                      
-                      <div className="absolute top-1 left-1">
-                        <button
-                          type="button"
-                          className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
-                          style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
-                          title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
-                          onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
-                        >
-                          {e.confirmed ? "✓" : ""}
-                        </button>
-                      </div>
-    <div className="absolute top-1 right-1 flex gap-1">
-                    <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
-                    <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
-                  </div>
-                  <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
-                  <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && (typeof e.price === "number" || e.price ? `• ₪${e.price}` : "")}</div>
-                  {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
-                </div>
-              ))}
+            <div className="flex gap-2">
+              <button className="bg-green-600 text-white px-3 py-2 rounded flex-1" onClick={() => setShowAddModal(true)}>+ הוסף אירוע</button>
+              <button className="bg-gray-800 text-white px-3 py-2 rounded flex-1" onClick={() => setShowTotalsModal(true)}>📊 סיכומים</button>
             </div>
-
-            {/* Editor */}
-            {selectedEvent && (
-              <div className="p-3 rounded border">
-                <div className="font-bold mb-2">עריכת אירוע</div>
-                <label className="block text-sm mb-1">שם האירוע</label>
-                <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.title} onChange={(e) => updateSelectedEvent({ title: e.target.value })} />
-
-                <label className="block text-sm mb-1">משך</label>
-                <select className="border p-1 w-full mb-2" value={selectedEvent.duration} onChange={(e) => updateSelectedEvent({ duration: Number(e.target.value) })}>
-                  {DURATIONS.map((m) => (<option key={m} value={m}>{durationLabel(m)}</option>))}
-                </select>
-
-                <label className="block text-sm mb-1">מחיר (₪)</label>
-                <input type="number" min="0" step="0.01" className="border p-1 w-full mb-2" value={selectedEvent.price} onChange={(e) => updateSelectedEvent({ price: e.target.value })} />
-
-                <label className="block text-sm mb-1">איש קשר</label>
-                <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
-
-                <label className="block text-sm mb-1">טלפון איש קשר</label>
-                <input type="tel" className="border p-1 w-full mb-2" value={selectedEvent.contactPhone || ""} onChange={(e) => updateSelectedEvent({ contactPhone: e.target.value })} />
-
-                <label className="block text-sm mb-1">ארגון</label>
-                <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.organization || ""} onChange={(e) => updateSelectedEvent({ organization: e.target.value })} />
-
-                <label className="block text-sm mb-1">תיאור</label>
-                <textarea className="border p-1 w-full h-20 mb-3" value={selectedEvent.description || ""} onChange={(e) => updateSelectedEvent({ description: e.target.value })} />
-
-                <label className="block text-sm mb-1">קטגוריה</label>
-                <select className="border p-1 w-full mb-3" value={selectedEvent.categoryKey || "general"} onChange={(e) => updateSelectedEvent({ categoryKey: e.target.value })}>
-                  {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
-                </select>
-
-                <div className="text-xs text-gray-600 mb-2">
-                  {selectedEvent.placed && selectedEvent.dayIndex != null && selectedEvent.time ? `ממוקם: יום ${selectedEvent.dayIndex + 1} • ${selectedEvent.time}` : "עדיין לא ננעץ בלוח"}
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <button className="bg-indigo-600 text-white px-3 py-1 rounded" onClick={() => setSelectedEventId(null)}>סיום עריכה</button>
-                  <button className="bg-red-600 text-white px-3 py-1 rounded" onClick={() => deleteEvent(selectedEvent.id)}>מחק אירוע</button>
-                </div>
-              </div>
-            )}
 
             {/* Export / Import */}
             <div className="p-3 rounded border">
@@ -808,63 +1171,17 @@ export default function InteractiveSchedule() {
               <div className="text-xs text-gray-600 mt-2">טיפ: בזמן גרירה אפשר ללחוץ ALT כדי <span className="font-medium">להעתיק</span> במקום להזיז.</div>
             </div>
 
-            {/* Totals */}
-                        <div className="p-3 rounded border">
-              <div className="font-bold mb-2">סיכומי קטגוריות {sumPlacedOnly ? "(נעוצים בלבד)" : "(כולל פתקים)"}</div>
-              <ul className="text-sm space-y-1">
-                {categories.map((c) => (
-                  <li key={c.key} className="flex items-center justify-between">
-                    <span className="flex items-center gap-2">
-                      <span className="inline-block w-3 h-3 rounded" style={{ background: c.color }} />
-                      {c.name}
-                    </span>
-                    <span>₪{(categoryTotals[c.key] || 0).toLocaleString()}</span>
-                  </li>
-                ))}
-                <li className="flex items-center justify-between border-t pt-1 mt-2 font-semibold">
-                  <span>סה״כ</span>
-                  <span>₪{categoriesGrandTotal.toLocaleString()}</span>
-                </li>
-              </ul>
-            </div>
-
-                        <div className="p-3 rounded border">
-              <div className="font-bold mb-2">סיכומי ארגונים {sumPlacedOnly ? "(נעוצים בלבד)" : "(כולל פתקים)"}</div>
-              <ul className="text-sm space-y-1">
-                {Object.entries(orgTotals).map(([org, sum]) => (
-                  <li key={org} className="flex items-center justify-between">
-                    <span className="truncate max-w-[12rem]" title={org}>{org}</span>
-                    <span>₪{sum.toLocaleString()}</span>
-                  </li>
-                ))}
-                <li className="flex items-center justify-between border-t pt-1 mt-2 font-semibold">
-                  <span>סה״כ</span>
-                  <span>₪{orgGrandTotal.toLocaleString()}</span>
-                </li>
-              </ul>
+            {/* Excel / CSV schedule import */}
+            <div className="p-3 rounded border">
+              <div className="font-bold mb-2">ייבוא לוח מאקסל / CSV</div>
+              <div className="text-xs text-gray-600 mb-2">מוסיף אירועים חדשים לתכנית הקיימת (לא מוחק כלום). מומלץ להתחיל מהתבנית.</div>
+              <button className="bg-emerald-700 text-white px-3 py-1 rounded w-full mb-2" onClick={downloadScheduleTemplate}>⬇ הורד תבנית (Excel)</button>
+              <label className="text-sm mb-1 block">ייבוא קובץ (.xlsx או .csv):</label>
+              <input type="file" accept=".xlsx,.xls,.csv" onChange={onImportScheduleFile} />
             </div>
 
             {/* Category manager */}
-            <div className="p-3 rounded border">
-              <div className="font-bold mb-2">ניהול קטגוריות</div>
-              <div className="space-y-2">
-                {categories.map((c) => (
-                  <div key={c.key} className="flex items-center gap-2">
-                    <input className="border p-1 flex-1" value={c.name} onChange={(e) => setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, name: e.target.value } : x))} />
-                    <input type="color" className="w-10 h-8 p-0 border rounded" value={c.color} onChange={(e) => setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, color: e.target.value } : x))} />
-                    <button className="px-2 py-1 text-red-700 border rounded" onClick={() => {
-                      setEvents((prev) => prev.map((e) => (e.categoryKey === c.key ? { ...e, categoryKey: "general" } : e)));
-                      setCategories((prev) => prev.filter((x) => x.key !== c.key));
-                    }} disabled={c.key === "general"}>מחק</button>
-                  </div>
-                ))}
-              </div>
-              <button className="mt-3 bg-emerald-600 text-white px-3 py-1 rounded" onClick={() => {
-                const key = `cat_${Math.random().toString(36).slice(2, 7)}`;
-                setCategories((prev) => [...prev, { key, name: "קטגוריה חדשה", color: "#93c5fd" }]);
-              }}>הוסף קטגוריה</button>
-              <div className="text-xs text-gray-500 mt-1">מחיקת קטגוריה מעבירה את האירועים שלה ל"כללי".</div>
-            </div>
+            <button className="bg-gray-800 text-white px-3 py-2 rounded w-full" onClick={() => setShowCategoriesModal(true)}>🏷️ ניהול קטגוריות</button>
           </div>
         </aside>
 
@@ -972,7 +1289,7 @@ export default function InteractiveSchedule() {
                         <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[10rem]">ארגון: {e.organization}</div>
                       )}
                       <div className="absolute bottom-1 right-2 text-[10px] opacity-85">
-                        {e.time} • {e.duration} דק' {showPrices && (typeof e.price === "number" && e.price > 0 ? `• ₪${e.price}` : "")}
+                        {e.time} • {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}
                       </div>
                       {/* Resize handle */}
                       <div
@@ -987,7 +1304,367 @@ export default function InteractiveSchedule() {
             ))}
           </div>
         </main>
+
+        {/* Notes bank (right side) */}
+        {notesBankOpen ? (
+          <>
+            <div
+              onMouseDown={onNotesResizeStart}
+              style={{ cursor: "col-resize", width: 6, background: "#e5e7eb", order: 3 }}
+              className="print:hidden hover:bg-gray-400 transition-colors"
+              title="גרור כדי לשנות רוחב בנק הפתקים"
+            />
+            <aside
+              className="shrink-0 print:hidden"
+              style={{ width: notesBankWidthPx, minWidth: 240, order: 4 }}
+              dir="rtl"
+            >
+              <div className="sticky top-4 p-2">
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="font-bold">בנק פתקים</h2>
+                  <button className="text-xs border rounded px-2 py-1" onClick={() => setNotesBankOpen(false)} title="סגור את בנק הפתקים">✕ סגור</button>
+                </div>
+
+                <div className="flex items-center gap-2 mb-2">
+                  <button
+                    type="button"
+                    className={`text-sm px-2 py-1 rounded border ${sidebarTab === "notes" ? "bg-gray-800 text-white" : "bg-white"}`}
+                    onClick={() => setSidebarTab("notes")}
+                  >
+                    פתקים ממתינים
+                  </button>
+                  <button
+                    type="button"
+                    className={`text-sm px-2 py-1 rounded border ${sidebarTab === "library" ? "bg-gray-800 text-white" : "bg-white"}`}
+                    onClick={() => setSidebarTab("library")}
+                  >
+                    כל הפעילויות
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2 mb-2 text-xs">
+                  <span className="text-gray-600">עמודות:</span>
+                  {[1, 2, 3].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      className={`px-2 py-0.5 rounded border ${notesBankColumns === n ? "bg-gray-800 text-white" : "bg-white"}`}
+                      onClick={() => setNotesBankColumns(n)}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+
+                {sidebarTab === "notes" ? (
+                  <>
+                    {events.filter((e) => !e.placed && visibleEventsFilter(e)).length === 0 && (
+                      <div className="text-xs text-gray-500">אין פתקים ממתינים (או שלא נמצאו בחיפוש/פילטרים)</div>
+                    )}
+                    <div className={`grid gap-2 ${GRID_COLS_CLASS[notesBankColumns] || "grid-cols-1"}`}>
+                    {events.filter((e) => !e.placed).filter(visibleEventsFilter).map((e) => (
+                      <div
+                        key={e.id}
+                        className="p-2 rounded mb-2 relative text-right"
+                        style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
+                        draggable
+                        onDragStart={(ev) => {
+                          ev.dataTransfer.setData("text/event-id", String(e.id));
+                          ev.dataTransfer.effectAllowed = "copyMove";
+                          setDraggedEventId(e.id);
+                        }}
+                        onDragEnd={() => setDraggedEventId(null)}
+                        dir="rtl"
+                      >
+                        <div className="absolute top-1 left-1">
+                          <button
+                            type="button"
+                            className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
+                            style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
+                            title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
+                            onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
+                          >
+                            {e.confirmed ? "✓" : ""}
+                          </button>
+                        </div>
+                        <div className="absolute top-1 right-1 flex gap-1">
+                          <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
+                          <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
+                        </div>
+                        <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
+                        <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
+                        {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
+                        <AudienceBadges audiences={e.audiences} />
+                      </div>
+                    ))}
+                    </div>
+                  </>
+                ) : (
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-xs text-gray-600">{events.filter(visibleEventsFilter).length} פעילויות</div>
+                      <select className="border p-1 text-xs" value={libraryGroupBy} onChange={(e) => setLibraryGroupBy(e.target.value)}>
+                        <option value="category">קבץ לפי קטגוריה</option>
+                        <option value="audience">קבץ לפי קהל יעד</option>
+                        <option value="price">קבץ לפי מחיר</option>
+                      </select>
+                    </div>
+                    {events.filter(visibleEventsFilter).length === 0 && (
+                      <div className="text-xs text-gray-500">לא נמצאו פעילויות (בדוק/י את הפילטרים)</div>
+                    )}
+                    {buildLibraryGroups().map((group) => group.items.length > 0 && (
+                      <div key={group.key} className="mb-3">
+                        <div className="text-xs font-semibold mb-1 flex items-center gap-2">
+                          <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: group.color }} />
+                          {group.label} ({group.items.length})
+                        </div>
+                        <div className={`grid gap-2 ${GRID_COLS_CLASS[notesBankColumns] || "grid-cols-1"}`}>
+                        {group.items.map((e) => (
+                          <div
+                            key={e.id}
+                            className="p-2 rounded mb-2 relative text-right cursor-grab"
+                            style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
+                            draggable
+                            onDragStart={(ev) => {
+                              ev.dataTransfer.setData("text/event-id", String(e.id));
+                              ev.dataTransfer.effectAllowed = "copyMove";
+                              setDraggedEventId(e.id);
+                            }}
+                            onDragEnd={() => setDraggedEventId(null)}
+                            dir="rtl"
+                            title="גרור/י ליומן כדי למקם או להזיז"
+                          >
+                            <div className="absolute top-1 left-1">
+                              <button
+                                type="button"
+                                className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
+                                style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
+                                title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
+                                onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
+                              >
+                                {e.confirmed ? "✓" : ""}
+                              </button>
+                            </div>
+                            <div className="absolute top-1 right-1 flex gap-1">
+                              <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
+                              <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
+                            </div>
+                            <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
+                            <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
+                            <div className="text-[11px] text-gray-700 mt-1">
+                              {e.placed && e.dayIndex != null && e.time ? `ממוקם: יום ${e.dayIndex + 1} • ${e.time}` : "לא ממוקם"}
+                            </div>
+                            {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
+                            <AudienceBadges audiences={e.audiences} />
+                          </div>
+                        ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </aside>
+          </>
+        ) : (
+          <button
+            type="button"
+            className="print:hidden self-start mt-4 border rounded px-2 py-1 text-xs bg-white h-fit"
+            style={{ order: 3 }}
+            onClick={() => setNotesBankOpen(true)}
+            title="פתח את בנק הפתקים"
+          >
+            📋 בנק פתקים
+          </button>
+        )}
       </div>
+
+      {/* Add Event modal */}
+      {showAddModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setShowAddModal(false)}>
+          <div className="bg-white rounded-xl shadow-xl w-[480px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
+            <div className="flex items-center justify-between border-b p-3">
+              <div className="font-bold">הוסף אירוע חדש</div>
+              <button className="px-3 py-1" onClick={() => setShowAddModal(false)}>סגור ✕</button>
+            </div>
+            <div className="max-h-[80vh] overflow-auto p-4">
+              <input type="text" placeholder="שם האירוע" className="border p-1 mb-2 w-full" value={newEvent.title} onChange={(e) => setNewEvent({ ...newEvent, title: e.target.value })} />
+              <select className="border p-1 mb-2 w-full" value={newEvent.duration} onChange={(e) => setNewEvent({ ...newEvent, duration: Number(e.target.value) })}>
+                {DURATIONS.map((m) => (
+                  <option key={m} value={m}>{durationLabel(m)}</option>
+                ))}
+              </select>
+              <input type="text" placeholder="איש קשר" className="border p-1 mb-2 w-full" value={newEvent.contact} onChange={(e) => setNewEvent({ ...newEvent, contact: e.target.value })} />
+              <input type="tel" placeholder="טלפון איש קשר" className="border p-1 mb-2 w-full" value={newEvent.contactPhone || ""} onChange={(e) => setNewEvent({ ...newEvent, contactPhone: e.target.value })} />
+              <input type="text" placeholder="ארגון" className="border p-1 mb-2 w-full" value={newEvent.organization} onChange={(e) => setNewEvent({ ...newEvent, organization: e.target.value })} />
+              <textarea placeholder="תיאור" className="border p-1 mb-2 w-full h-16" value={newEvent.description} onChange={(e) => setNewEvent({ ...newEvent, description: e.target.value })} />
+              <select className="border p-1 mb-2 w-full" value={newEvent.categoryKey} onChange={(e) => setNewEvent({ ...newEvent, categoryKey: e.target.value })}>
+                {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
+              </select>
+              <div className="text-xs mb-1 text-gray-600">קהל יעד:</div>
+              <div className="mb-2">
+                <AudienceCheckboxes selected={newEvent.audiences} onChange={(audiences) => setNewEvent({ ...newEvent, audiences })} />
+              </div>
+              <div className="text-xs mb-1 text-gray-600">עלות (רכיבים):</div>
+              <div className="mb-2">
+                <CostItemsEditor items={newEvent.costItems} onChange={(costItems) => setNewEvent({ ...newEvent, costItems })} />
+              </div>
+              <button
+                className="bg-green-600 text-white px-3 py-1 rounded w-full"
+                onClick={() => { addEvent(); setShowAddModal(false); }}
+              >
+                הוסף פתק
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Event modal */}
+      {selectedEvent && (
+        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setSelectedEventId(null)}>
+          <div className="bg-white rounded-xl shadow-xl w-[480px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
+            <div className="flex items-center justify-between border-b p-3">
+              <div className="font-bold">עריכת אירוע</div>
+              <button className="px-3 py-1" onClick={() => setSelectedEventId(null)}>סגור ✕</button>
+            </div>
+            <div className="max-h-[80vh] overflow-auto p-4">
+              <label className="block text-sm mb-1">שם האירוע</label>
+              <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.title} onChange={(e) => updateSelectedEvent({ title: e.target.value })} />
+
+              <label className="block text-sm mb-1">משך</label>
+              <select className="border p-1 w-full mb-2" value={selectedEvent.duration} onChange={(e) => updateSelectedEvent({ duration: Number(e.target.value) })}>
+                {DURATIONS.map((m) => (<option key={m} value={m}>{durationLabel(m)}</option>))}
+              </select>
+
+              <label className="block text-sm mb-1">עלות (רכיבים)</label>
+              <div className="mb-2">
+                <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
+              </div>
+
+              <label className="block text-sm mb-1">איש קשר</label>
+              <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
+
+              <label className="block text-sm mb-1">טלפון איש קשר</label>
+              <input type="tel" className="border p-1 w-full mb-2" value={selectedEvent.contactPhone || ""} onChange={(e) => updateSelectedEvent({ contactPhone: e.target.value })} />
+
+              <label className="block text-sm mb-1">ארגון</label>
+              <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.organization || ""} onChange={(e) => updateSelectedEvent({ organization: e.target.value })} />
+
+              <label className="block text-sm mb-1">תיאור</label>
+              <textarea className="border p-1 w-full h-20 mb-3" value={selectedEvent.description || ""} onChange={(e) => updateSelectedEvent({ description: e.target.value })} />
+
+              <label className="block text-sm mb-1">קטגוריה</label>
+              <select className="border p-1 w-full mb-3" value={selectedEvent.categoryKey || "general"} onChange={(e) => updateSelectedEvent({ categoryKey: e.target.value })}>
+                {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
+              </select>
+
+              <label className="block text-sm mb-1">קהל יעד</label>
+              <div className="mb-3">
+                <AudienceCheckboxes selected={selectedEvent.audiences} onChange={(audiences) => updateSelectedEvent({ audiences })} />
+              </div>
+
+              <div className="text-xs text-gray-600 mb-2">
+                {selectedEvent.placed && selectedEvent.dayIndex != null && selectedEvent.time ? `ממוקם: יום ${selectedEvent.dayIndex + 1} • ${selectedEvent.time}` : "עדיין לא ננעץ בלוח"}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button className="bg-indigo-600 text-white px-3 py-1 rounded" onClick={() => setSelectedEventId(null)}>סיום עריכה</button>
+                <button className="bg-red-600 text-white px-3 py-1 rounded" onClick={() => deleteEvent(selectedEvent.id)}>מחק אירוע</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Totals modal */}
+      {showTotalsModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setShowTotalsModal(false)}>
+          <div className="bg-white rounded-xl shadow-xl w-[520px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
+            <div className="flex items-center justify-between border-b p-3">
+              <div className="font-bold">סיכומים</div>
+              <button className="px-3 py-1" onClick={() => setShowTotalsModal(false)}>סגור ✕</button>
+            </div>
+            <div className="max-h-[80vh] overflow-auto p-4 space-y-4">
+              <label className="text-sm flex items-center gap-2">
+                <input type="checkbox" checked={sumPlacedOnly} onChange={(e) => setSumPlacedOnly(e.target.checked)} />
+                חשב סכומים רק לאירועים שננעצו
+              </label>
+
+              <div className="p-3 rounded border">
+                <div className="font-bold mb-2">סיכומי קטגוריות {sumPlacedOnly ? "(נעוצים בלבד)" : "(כולל פתקים)"}</div>
+                <div className="mb-3">
+                  <PieChart data={categories.map((c) => ({ label: c.name, value: categoryTotals[c.key] || 0, color: c.color }))} />
+                </div>
+                <ul className="text-sm space-y-1">
+                  {categories.map((c) => (
+                    <li key={c.key} className="flex items-center justify-between">
+                      <span className="flex items-center gap-2">
+                        <span className="inline-block w-3 h-3 rounded" style={{ background: c.color }} />
+                        {c.name}
+                      </span>
+                      <span>₪{(categoryTotals[c.key] || 0).toLocaleString()}</span>
+                    </li>
+                  ))}
+                  <li className="flex items-center justify-between border-t pt-1 mt-2 font-semibold">
+                    <span>סה״כ</span>
+                    <span>₪{categoriesGrandTotal.toLocaleString()}</span>
+                  </li>
+                </ul>
+              </div>
+
+              <div className="p-3 rounded border">
+                <div className="font-bold mb-2">סיכומי ארגונים {sumPlacedOnly ? "(נעוצים בלבד)" : "(כולל פתקים)"}</div>
+                <div className="mb-3">
+                  <PieChart data={Object.entries(orgTotals).map(([org, sum], i) => ({ label: org, value: sum, color: colorForIndex(i) }))} />
+                </div>
+                <ul className="text-sm space-y-1">
+                  {Object.entries(orgTotals).map(([org, sum]) => (
+                    <li key={org} className="flex items-center justify-between">
+                      <span className="truncate max-w-[12rem]" title={org}>{org}</span>
+                      <span>₪{sum.toLocaleString()}</span>
+                    </li>
+                  ))}
+                  <li className="flex items-center justify-between border-t pt-1 mt-2 font-semibold">
+                    <span>סה״כ</span>
+                    <span>₪{orgGrandTotal.toLocaleString()}</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Categories modal */}
+      {showCategoriesModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setShowCategoriesModal(false)}>
+          <div className="bg-white rounded-xl shadow-xl w-[480px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
+            <div className="flex items-center justify-between border-b p-3">
+              <div className="font-bold">ניהול קטגוריות</div>
+              <button className="px-3 py-1" onClick={() => setShowCategoriesModal(false)}>סגור ✕</button>
+            </div>
+            <div className="max-h-[80vh] overflow-auto p-4">
+              <div className="space-y-2">
+                {categories.map((c) => (
+                  <div key={c.key} className="flex items-center gap-2">
+                    <input className="border p-1 flex-1" value={c.name} onChange={(e) => setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, name: e.target.value } : x))} />
+                    <input type="color" className="w-10 h-8 p-0 border rounded" value={c.color} onChange={(e) => setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, color: e.target.value } : x))} />
+                    <button className="px-2 py-1 text-red-700 border rounded" onClick={() => {
+                      setEvents((prev) => prev.map((e) => (e.categoryKey === c.key ? { ...e, categoryKey: "general" } : e)));
+                      setCategories((prev) => prev.filter((x) => x.key !== c.key));
+                    }} disabled={c.key === "general"}>מחק</button>
+                  </div>
+                ))}
+              </div>
+              <button className="mt-3 bg-emerald-600 text-white px-3 py-1 rounded" onClick={() => {
+                const key = `cat_${Math.random().toString(36).slice(2, 7)}`;
+                setCategories((prev) => [...prev, { key, name: "קטגוריה חדשה", color: "#93c5fd" }]);
+              }}>הוסף קטגוריה</button>
+              <div className="text-xs text-gray-500 mt-1">מחיקת קטגוריה מעבירה את האירועים שלה ל"כללי".</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Zoom modal: single-day canvas with absolute events + resize handle */}
       {zoomDay != null && (
@@ -1071,7 +1748,7 @@ export default function InteractiveSchedule() {
                           <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[12rem]">ארגון: {e.organization}</div>
                         )}
                         <div className="absolute bottom-1 right-2 text-[10px] opacity-85">
-                          {e.time} • {e.duration} דק' {showPrices && (typeof e.price === "number" && e.price > 0 ? `• ₪${e.price}` : "")}
+                          {e.time} • {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}
                         </div>
                         {/* Resize handle */}
                         <div
