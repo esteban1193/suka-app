@@ -297,6 +297,19 @@ const migrateEvent = (e) => {
   return Array.isArray(e.costItems) ? e : { ...e, costItems: [] };
 };
 const normalizeOrg = (s) => (s && s.trim()) ? s.trim() : "ללא ארגון";
+const triggerJsonDownload = (payload, filename) => {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+const formatTimestampForFilename = (d) => {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}`;
+};
 const durationLabel = (m) => {
   if (m % 60 === 0) {
     const h = m / 60;
@@ -411,6 +424,65 @@ export default function InteractiveSchedule() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [showTotalsModal, setShowTotalsModal] = useState(false);
   const [showCategoriesModal, setShowCategoriesModal] = useState(false);
+  const [autoBackupEnabled, setAutoBackupEnabled] = useState(false);
+  const [autoBackupIntervalMin, setAutoBackupIntervalMin] = useState(10);
+  const [lastBackupAt, setLastBackupAt] = useState("");
+
+  // Dual-screen mode: this window is a popped-out notes bank if opened with ?popout=bank
+  const isPopout = new URLSearchParams(window.location.search).get("popout") === "bank";
+  // The event currently "armed" for placement from the other window (or this one) — click a
+  // card to arm it, then click a day/slot to place it, since real drag-and-drop can't cross a
+  // browser-window boundary. Synced between windows via BroadcastChannel (see effect below).
+  const [armedEventId, setArmedEventId] = useState(null);
+  const bcRef = useRef(null);
+  useEffect(() => {
+    const bc = new BroadcastChannel("suka-app-bank-sync");
+    bcRef.current = bc;
+    bc.onmessage = (ev) => {
+      if (ev.data?.type === "arm") setArmedEventId(ev.data.id);
+      else if (ev.data?.type === "clear-armed") setArmedEventId(null);
+    };
+    return () => bc.close();
+  }, []);
+  const broadcastArm = (msg) => bcRef.current?.postMessage(msg);
+  const armEvent = (id) => {
+    setArmedEventId((prev) => {
+      const next = prev === id ? null : id;
+      broadcastArm({ type: next ? "arm" : "clear-armed", id: next });
+      return next;
+    });
+  };
+  const armedEvent = armedEventId ? events.find((e) => e.id === armedEventId) : null;
+  const openBankPopout = () => {
+    const url = new URL(window.location.href);
+    url.search = "?popout=bank";
+    window.open(url.toString(), "suka-notes-bank", "width=460,height=900,left=80,top=80");
+  };
+
+  // Always-current snapshot for the auto-backup timer (see effect below) — the interval is
+  // only re-armed when the interval length changes, not on every keystroke, so its callback
+  // must read state via a ref rather than closing over startDate/events/categories directly.
+  const backupStateRef = useRef({ startDate, events, categories });
+  useEffect(() => {
+    backupStateRef.current = { startDate, events, categories };
+  }, [startDate, events, categories]);
+  const lastBackupSignatureRef = useRef(null);
+
+  const performAutoBackup = () => {
+    const payload = backupStateRef.current;
+    const signature = JSON.stringify(payload);
+    if (signature === lastBackupSignatureRef.current) return; // nothing changed since last backup
+    lastBackupSignatureRef.current = signature;
+    triggerJsonDownload(payload, `schedule-backup-${formatTimestampForFilename(new Date())}.json`);
+    setLastBackupAt(new Date().toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" }));
+  };
+
+  useEffect(() => {
+    if (!autoBackupEnabled) return;
+    const id = setInterval(performAutoBackup, autoBackupIntervalMin * 60 * 1000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoBackupEnabled, autoBackupIntervalMin]);
 
   // resizer refs (sidebar)
   const isResizingSidebar = useRef(false);
@@ -421,6 +493,13 @@ export default function InteractiveSchedule() {
   const isResizingNotesBank = useRef(false);
   const notesStartX = useRef(0);
   const notesStartW = useRef(0);
+
+  // set right before applying a remote (other-window) schedule update, so the resulting
+  // re-render's auto-save effect doesn't immediately write the exact same data straight back
+  // (which would otherwise ping-pong a redundant storage event to the other window)
+  const suppressNextSaveRef = useRef(false);
+  // See the auto-save effect below — skips writing on the effect's very first invocation.
+  const isFirstAutoSaveRun = useRef(true);
 
   // ===== Resize event (change duration by dragging bottom edge) =====
   const [resizingInfo, setResizingInfo] = useState(null); // { id, startY, originalBlocks, startIdx, dayIndex }
@@ -494,32 +573,61 @@ export default function InteractiveSchedule() {
   }, [resizingInfo, events]);
 
   
+  // Full hydration (schedule data + this window's own UI prefs) — used once at mount.
+  const applyPersistedState = (data) => {
+    if (!data || typeof data !== "object") return;
+    if (typeof data.startDate === "string") setStartDate(data.startDate);
+    if (Array.isArray(data.events)) setEvents(data.events.map(migrateEvent));
+    if (Array.isArray(data.categories)) setCategories(data.categories);
+    if (typeof data.sidebarWidthPx === "number") setSidebarWidthPx(data.sidebarWidthPx);
+    if (data.sidebarPos === "left" || data.sidebarPos === "right") setSidebarPos(data.sidebarPos);
+    if (typeof data.notesBankOpen === "boolean") setNotesBankOpen(data.notesBankOpen);
+    if (typeof data.notesBankWidthPx === "number") setNotesBankWidthPx(data.notesBankWidthPx);
+    if ([1, 2, 3].includes(data.notesBankColumns)) setNotesBankColumns(data.notesBankColumns);
+    if (typeof data.autoBackupEnabled === "boolean") setAutoBackupEnabled(data.autoBackupEnabled);
+    if ([5, 10, 15, 30].includes(data.autoBackupIntervalMin)) setAutoBackupIntervalMin(data.autoBackupIntervalMin);
+    if (typeof data.dayColWidthPx === "number") setDayColWidthPx(data.dayColWidthPx);
+    if (typeof data.sumPlacedOnly === "boolean") setSumPlacedOnly(data.sumPlacedOnly);
+    if (typeof data.filterCategory === "string") setFilterCategory(data.filterCategory);
+    if (typeof data.filterOrg === "string") setFilterOrg(data.filterOrg);
+    if (typeof data.filterConfirmed === "string") setFilterConfirmed(data.filterConfirmed);
+    if (typeof data.filterAudience === "string") setFilterAudience(data.filterAudience);
+    if (typeof data.searchText === "string") setSearchText(data.searchText);
+  };
+
+  // Partial hydration used for cross-window sync (see storage-event effect below) — only the
+  // actual shared schedule content, so each window (e.g. a popped-out notes bank on a second
+  // monitor) keeps its own independent panel widths/filters/column layout.
+  const applyRemoteScheduleState = (data) => {
+    if (!data || typeof data !== "object") return;
+    if (typeof data.startDate === "string") setStartDate(data.startDate);
+    if (Array.isArray(data.events)) setEvents(data.events.map(migrateEvent));
+    if (Array.isArray(data.categories)) setCategories(data.categories);
+  };
+
   // ===== Load persisted state (once) =====
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const data = JSON.parse(raw);
-      if (data && typeof data === "object") {
-        if (typeof data.startDate === "string") setStartDate(data.startDate);
-        if (Array.isArray(data.events)) setEvents(data.events.map(migrateEvent));
-        if (Array.isArray(data.categories)) setCategories(data.categories);
-        if (typeof data.sidebarWidthPx === "number") setSidebarWidthPx(data.sidebarWidthPx);
-        if (data.sidebarPos === "left" || data.sidebarPos === "right") setSidebarPos(data.sidebarPos);
-        if (typeof data.notesBankOpen === "boolean") setNotesBankOpen(data.notesBankOpen);
-        if (typeof data.notesBankWidthPx === "number") setNotesBankWidthPx(data.notesBankWidthPx);
-        if ([1, 2, 3].includes(data.notesBankColumns)) setNotesBankColumns(data.notesBankColumns);
-        if (typeof data.dayColWidthPx === "number") setDayColWidthPx(data.dayColWidthPx);
-        if (typeof data.sumPlacedOnly === "boolean") setSumPlacedOnly(data.sumPlacedOnly);
-        if (typeof data.filterCategory === "string") setFilterCategory(data.filterCategory);
-        if (typeof data.filterOrg === "string") setFilterOrg(data.filterOrg);
-        if (typeof data.filterConfirmed === "string") setFilterConfirmed(data.filterConfirmed);
-        if (typeof data.filterAudience === "string") setFilterAudience(data.filterAudience);
-        if (typeof data.searchText === "string") setSearchText(data.searchText);
-      }
+      if (raw) applyPersistedState(JSON.parse(raw));
     } catch (e) {
       console.warn("Failed to load saved schedule:", e);
     }
+  }, []);
+
+  // ===== Cross-window sync: pick up schedule changes made in another window/tab =====
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      try {
+        suppressNextSaveRef.current = true;
+        applyRemoteScheduleState(JSON.parse(e.newValue));
+      } catch (err) {
+        console.warn("Failed to sync schedule from another window:", err);
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const catByKey = useMemo(
@@ -657,6 +765,19 @@ export default function InteractiveSchedule() {
 
   // ===== Auto-save to localStorage on changes =====
   useEffect(() => {
+    if (isFirstAutoSaveRun.current) {
+      // Skip the very first invocation: it fires with the default/empty state, before the
+      // "load persisted state" effect's setEvents/setCategories have actually reached a
+      // render. Writing here would briefly overwrite real saved data with blanks — invisible
+      // in a single window (self-corrects a tick later), but a popped-out window's `storage`
+      // listener would catch that split-second bad write and wipe the other window too.
+      isFirstAutoSaveRun.current = false;
+      return;
+    }
+    if (suppressNextSaveRef.current) {
+      suppressNextSaveRef.current = false;
+      return;
+    }
     try {
       const payload = {
         startDate,
@@ -667,6 +788,8 @@ export default function InteractiveSchedule() {
         notesBankOpen,
         notesBankWidthPx,
         notesBankColumns,
+        autoBackupEnabled,
+        autoBackupIntervalMin,
         dayColWidthPx,
         sumPlacedOnly,
         filterCategory,
@@ -679,19 +802,12 @@ export default function InteractiveSchedule() {
     } catch (e) {
       console.warn("Failed to save schedule:", e);
     }
-  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, notesBankOpen, notesBankWidthPx, notesBankColumns, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, filterAudience, searchText]);
+  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, notesBankOpen, notesBankWidthPx, notesBankColumns, autoBackupEnabled, autoBackupIntervalMin, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, filterAudience, searchText]);
 
 
   // Export
   const exportJSON = () => {
-    const payload = { startDate, events, categories };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "schedule.json";
-    a.click();
-    URL.revokeObjectURL(url);
+    triggerJsonDownload({ startDate, events, categories }, "schedule.json");
   };
 
   
@@ -979,6 +1095,9 @@ export default function InteractiveSchedule() {
   const toggleConfirmed = (id) => {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, confirmed: !e.confirmed } : e)));
   };
+  const sendToBank = (id) => {
+    setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, placed: false, dayIndex: null, time: null } : e)));
+  };
 
 
   // sidebar resizer handlers
@@ -1045,6 +1164,233 @@ export default function InteractiveSchedule() {
      UI
      ===================== */
   const isSidebarLeft = sidebarPos === "left";
+
+  // Shared between the normal layout's notes-bank <aside> and the popped-out bank window
+  // (?popout=bank) so the tab/library/card markup only exists once.
+  const notesBankTabs = (
+    <>
+      <div className="flex items-center gap-2 mb-2">
+        <button
+          type="button"
+          className={`text-sm px-2 py-1 rounded border ${sidebarTab === "notes" ? "bg-gray-800 text-white" : "bg-white"}`}
+          onClick={() => setSidebarTab("notes")}
+        >
+          פתקים ממתינים
+        </button>
+        <button
+          type="button"
+          className={`text-sm px-2 py-1 rounded border ${sidebarTab === "library" ? "bg-gray-800 text-white" : "bg-white"}`}
+          onClick={() => setSidebarTab("library")}
+        >
+          כל הפעילויות
+        </button>
+      </div>
+
+      <div className="flex items-center gap-2 mb-2 text-xs">
+        <span className="text-gray-600">עמודות:</span>
+        {[1, 2, 3].map((n) => (
+          <button
+            key={n}
+            type="button"
+            className={`px-2 py-0.5 rounded border ${notesBankColumns === n ? "bg-gray-800 text-white" : "bg-white"}`}
+            onClick={() => setNotesBankColumns(n)}
+          >
+            {n}
+          </button>
+        ))}
+      </div>
+
+      {sidebarTab === "notes" ? (
+        <>
+          {events.filter((e) => !e.placed && visibleEventsFilter(e)).length === 0 && (
+            <div className="text-xs text-gray-500">אין פתקים ממתינים (או שלא נמצאו בחיפוש/פילטרים)</div>
+          )}
+          <div className={`grid gap-2 ${GRID_COLS_CLASS[notesBankColumns] || "grid-cols-1"}`}>
+          {events.filter((e) => !e.placed).filter(visibleEventsFilter).map((e) => (
+            <div
+              key={e.id}
+              className={`p-2 rounded mb-2 relative text-right cursor-pointer ${armedEventId === e.id ? "ring-2 ring-amber-500" : ""}`}
+              style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
+              draggable
+              onDragStart={(ev) => {
+                ev.dataTransfer.setData("text/event-id", String(e.id));
+                ev.dataTransfer.effectAllowed = "copyMove";
+                setDraggedEventId(e.id);
+              }}
+              onDragEnd={() => setDraggedEventId(null)}
+              onClick={() => armEvent(e.id)}
+              title="לחצ/י כדי לסמן למיקום, ואז לחצ/י על משבצת בלוח (גם בחלון אחר)"
+              dir="rtl"
+            >
+              <div className="absolute top-1 left-1">
+                <button
+                  type="button"
+                  className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
+                  style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
+                  title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
+                  onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
+                >
+                  {e.confirmed ? "✓" : ""}
+                </button>
+              </div>
+              <div className="absolute top-1 right-1 flex gap-1">
+                <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
+                <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
+              </div>
+              <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
+              <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
+              {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
+              <AudienceBadges audiences={e.audiences} />
+            </div>
+          ))}
+          </div>
+        </>
+      ) : (
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-gray-600">{events.filter(visibleEventsFilter).length} פעילויות</div>
+            <select className="border p-1 text-xs" value={libraryGroupBy} onChange={(e) => setLibraryGroupBy(e.target.value)}>
+              <option value="category">קבץ לפי קטגוריה</option>
+              <option value="audience">קבץ לפי קהל יעד</option>
+              <option value="price">קבץ לפי מחיר</option>
+            </select>
+          </div>
+          {events.filter(visibleEventsFilter).length === 0 && (
+            <div className="text-xs text-gray-500">לא נמצאו פעילויות (בדוק/י את הפילטרים)</div>
+          )}
+          {buildLibraryGroups().map((group) => group.items.length > 0 && (
+            <div key={group.key} className="mb-3">
+              <div className="text-xs font-semibold mb-1 flex items-center gap-2">
+                <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: group.color }} />
+                {group.label} ({group.items.length})
+              </div>
+              <div className={`grid gap-2 ${GRID_COLS_CLASS[notesBankColumns] || "grid-cols-1"}`}>
+              {group.items.map((e) => (
+                <div
+                  key={e.id}
+                  className={`p-2 rounded mb-2 relative text-right cursor-pointer ${armedEventId === e.id ? "ring-2 ring-amber-500" : ""}`}
+                  style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
+                  draggable
+                  onDragStart={(ev) => {
+                    ev.dataTransfer.setData("text/event-id", String(e.id));
+                    ev.dataTransfer.effectAllowed = "copyMove";
+                    setDraggedEventId(e.id);
+                  }}
+                  onDragEnd={() => setDraggedEventId(null)}
+                  onClick={() => armEvent(e.id)}
+                  dir="rtl"
+                  title="גרור/י ליומן כדי למקם או להזיז, או לחצ/י כדי לסמן למיקום מחלון אחר"
+                >
+                  <div className="absolute top-1 left-1">
+                    <button
+                      type="button"
+                      className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
+                      style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
+                      title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
+                      onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
+                    >
+                      {e.confirmed ? "✓" : ""}
+                    </button>
+                  </div>
+                  <div className="absolute top-1 right-1 flex gap-1">
+                    <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
+                    <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
+                  </div>
+                  <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
+                  <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
+                  <div className="text-[11px] text-gray-700 mt-1">
+                    {e.placed && e.dayIndex != null && e.time ? `ממוקם: יום ${e.dayIndex + 1} • ${e.time}` : "לא ממוקם"}
+                  </div>
+                  {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
+                  <AudienceBadges audiences={e.audiences} />
+                </div>
+              ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+
+  // Shared between the docked layout and the popped-out bank window, so editing an event
+  // always has every field available, regardless of which window it was opened from.
+  const editEventModal = selectedEvent && (
+    <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setSelectedEventId(null)}>
+      <div className="bg-white rounded-xl shadow-xl w-[480px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
+        <div className="flex items-center justify-between border-b p-3">
+          <div className="font-bold">עריכת אירוע</div>
+          <button className="px-3 py-1" onClick={() => setSelectedEventId(null)}>סגור ✕</button>
+        </div>
+        <div className="max-h-[80vh] overflow-auto p-4">
+          <label className="block text-sm mb-1">שם האירוע</label>
+          <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.title} onChange={(e) => updateSelectedEvent({ title: e.target.value })} />
+
+          <label className="block text-sm mb-1">משך</label>
+          <select className="border p-1 w-full mb-2" value={selectedEvent.duration} onChange={(e) => updateSelectedEvent({ duration: Number(e.target.value) })}>
+            {DURATIONS.map((m) => (<option key={m} value={m}>{durationLabel(m)}</option>))}
+          </select>
+
+          <label className="block text-sm mb-1">עלות (רכיבים)</label>
+          <div className="mb-2">
+            <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
+          </div>
+
+          <label className="block text-sm mb-1">איש קשר</label>
+          <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
+
+          <label className="block text-sm mb-1">טלפון איש קשר</label>
+          <input type="tel" className="border p-1 w-full mb-2" value={selectedEvent.contactPhone || ""} onChange={(e) => updateSelectedEvent({ contactPhone: e.target.value })} />
+
+          <label className="block text-sm mb-1">ארגון</label>
+          <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.organization || ""} onChange={(e) => updateSelectedEvent({ organization: e.target.value })} />
+
+          <label className="block text-sm mb-1">תיאור</label>
+          <textarea className="border p-1 w-full h-20 mb-3" value={selectedEvent.description || ""} onChange={(e) => updateSelectedEvent({ description: e.target.value })} />
+
+          <label className="block text-sm mb-1">קטגוריה</label>
+          <select className="border p-1 w-full mb-3" value={selectedEvent.categoryKey || "general"} onChange={(e) => updateSelectedEvent({ categoryKey: e.target.value })}>
+            {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
+          </select>
+
+          <label className="block text-sm mb-1">קהל יעד</label>
+          <div className="mb-3">
+            <AudienceCheckboxes selected={selectedEvent.audiences} onChange={(audiences) => updateSelectedEvent({ audiences })} />
+          </div>
+
+          <div className="text-xs text-gray-600 mb-2">
+            {selectedEvent.placed && selectedEvent.dayIndex != null && selectedEvent.time ? `ממוקם: יום ${selectedEvent.dayIndex + 1} • ${selectedEvent.time}` : "עדיין לא ננעץ בלוח"}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button className="bg-indigo-600 text-white px-3 py-1 rounded" onClick={() => setSelectedEventId(null)}>סיום עריכה</button>
+            {selectedEvent.placed && (
+              <button className="bg-amber-600 text-white px-3 py-1 rounded" onClick={() => sendToBank(selectedEvent.id)}>📥 החזר לבנק</button>
+            )}
+            <button className="bg-red-600 text-white px-3 py-1 rounded" onClick={() => deleteEvent(selectedEvent.id)}>מחק אירוע</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (isPopout) {
+    return (
+      <div className="p-3" dir="rtl">
+        <div className="flex items-center justify-between mb-2">
+          <h1 className="font-bold text-lg">בנק פתקים — {startDate}</h1>
+          <a href={window.location.pathname} className="text-xs border rounded px-2 py-1">↩ תצוגה מלאה</a>
+        </div>
+        {armedEvent && (
+          <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-400 text-amber-900 text-xs rounded px-2 py-1.5 mb-2">
+            <span>📌 מסומן: <b>{armedEvent.title || "ללא כותרת"}</b> — עברו לחלון הלוח ולחצו על משבצת</span>
+            <button className="border border-amber-500 rounded px-1.5" onClick={() => { setArmedEventId(null); broadcastArm({ type: "clear-armed" }); }}>ביטול</button>
+          </div>
+        )}
+        {notesBankTabs}
+        {editEventModal}
+      </div>
+    );
+  }
 
   return (
     <div className="p-4 space-y-3 print:block print-page">
@@ -1171,6 +1517,36 @@ export default function InteractiveSchedule() {
               <div className="text-xs text-gray-600 mt-2">טיפ: בזמן גרירה אפשר ללחוץ ALT כדי <span className="font-medium">להעתיק</span> במקום להזיז.</div>
             </div>
 
+            {/* Auto backup */}
+            <div className="p-3 rounded border">
+              <div className="font-bold mb-2">גיבוי אוטומטי</div>
+              <label className="text-sm flex items-center gap-2 mb-2">
+                <input
+                  type="checkbox"
+                  checked={autoBackupEnabled}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setAutoBackupEnabled(on);
+                    if (on) performAutoBackup();
+                  }}
+                />
+                הורד קובץ גיבוי (JSON) אוטומטית כל
+              </label>
+              <select
+                className="border p-1 mb-2"
+                value={autoBackupIntervalMin}
+                disabled={!autoBackupEnabled}
+                onChange={(e) => setAutoBackupIntervalMin(Number(e.target.value))}
+              >
+                <option value={5}>5 דקות</option>
+                <option value={10}>10 דקות</option>
+                <option value={15}>15 דקות</option>
+                <option value={30}>30 דקות</option>
+              </select>
+              {lastBackupAt && <div className="text-xs text-gray-600">גיבוי אחרון: {lastBackupAt}</div>}
+              <div className="text-xs text-gray-500 mt-1">הקובץ יורד לתיקיית ההורדות של הדפדפן; מדלג אם שום דבר לא השתנה מאז הגיבוי הקודם. בחלק מהדפדפנים ייתכן שיוצג אישור להורדות חוזרות.</div>
+            </div>
+
             {/* Excel / CSV schedule import */}
             <div className="p-3 rounded border">
               <div className="font-bold mb-2">ייבוא לוח מאקסל / CSV</div>
@@ -1195,6 +1571,12 @@ export default function InteractiveSchedule() {
 
         {/* Schedule area */}
         <main className="flex-1 overflow-x-auto print-main" style={{ order: isSidebarLeft ? 2 : 0 }} dir="rtl">
+          {armedEvent && (
+            <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-400 text-amber-900 text-sm rounded px-3 py-2 mb-2 print:hidden" dir="rtl">
+              <span>📌 מוכן למיקום: <b>{armedEvent.title || "ללא כותרת"}</b> — לחצ/י על משבצת בלוח כדי למקם</span>
+              <button className="text-xs border border-amber-500 rounded px-2 py-1" onClick={() => { setArmedEventId(null); broadcastArm({ type: "clear-armed" }); }}>ביטול</button>
+            </div>
+          )}
           {/* Day headers */}
           <div className="grid grid-headers print-grid" style={{ gridTemplateColumns: `6rem repeat(${days.length}, ${dayColWidthPx}px)` }} dir="rtl">
             <div className="p-2 text-right text-sm font-bold bg-gray-50 border">שעה</div>
@@ -1233,7 +1615,13 @@ export default function InteractiveSchedule() {
                 style={{ height: timeSlots.length * SLOT_PX, backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.08) 1px, transparent 1px)`, backgroundSize: `100% ${SLOT_PX}px` }}
                 onClick={(ev) => {
                   const time = timeFromClientY(ev.currentTarget, ev.clientY);
-                  placeEventExact(dayIndex, time);
+                  if (armedEventId) {
+                    placeEventExact(dayIndex, time, armedEventId);
+                    setArmedEventId(null);
+                    broadcastArm({ type: "clear-armed" });
+                  } else {
+                    placeEventExact(dayIndex, time);
+                  }
                 }}
                 onDragOver={(ev) => {
                   ev.preventDefault();
@@ -1281,6 +1669,7 @@ export default function InteractiveSchedule() {
                         </button>
                       </div>
 <div className="absolute top-1 right-1 flex gap-1">
+                        <button title="החזר לבנק" className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); sendToBank(e.id); }}>📥</button>
                         <button title="עריכה" className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); setSelectedEventId(e.id); }}>✎</button>
                         <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                       </div>
@@ -1322,147 +1711,20 @@ export default function InteractiveSchedule() {
               <div className="sticky top-4 p-2">
                 <div className="flex items-center justify-between mb-2">
                   <h2 className="font-bold">בנק פתקים</h2>
-                  <button className="text-xs border rounded px-2 py-1" onClick={() => setNotesBankOpen(false)} title="סגור את בנק הפתקים">✕ סגור</button>
+                  <div className="flex gap-1">
+                    <button className="text-xs border rounded px-2 py-1" onClick={openBankPopout} title="פתח את הבנק בחלון נפרד — אפשר לגרור למסך שני">🖥 חלון נפרד</button>
+                    <button className="text-xs border rounded px-2 py-1" onClick={() => setNotesBankOpen(false)} title="סגור את בנק הפתקים">✕ סגור</button>
+                  </div>
                 </div>
 
-                <div className="flex items-center gap-2 mb-2">
-                  <button
-                    type="button"
-                    className={`text-sm px-2 py-1 rounded border ${sidebarTab === "notes" ? "bg-gray-800 text-white" : "bg-white"}`}
-                    onClick={() => setSidebarTab("notes")}
-                  >
-                    פתקים ממתינים
-                  </button>
-                  <button
-                    type="button"
-                    className={`text-sm px-2 py-1 rounded border ${sidebarTab === "library" ? "bg-gray-800 text-white" : "bg-white"}`}
-                    onClick={() => setSidebarTab("library")}
-                  >
-                    כל הפעילויות
-                  </button>
-                </div>
-
-                <div className="flex items-center gap-2 mb-2 text-xs">
-                  <span className="text-gray-600">עמודות:</span>
-                  {[1, 2, 3].map((n) => (
-                    <button
-                      key={n}
-                      type="button"
-                      className={`px-2 py-0.5 rounded border ${notesBankColumns === n ? "bg-gray-800 text-white" : "bg-white"}`}
-                      onClick={() => setNotesBankColumns(n)}
-                    >
-                      {n}
-                    </button>
-                  ))}
-                </div>
-
-                {sidebarTab === "notes" ? (
-                  <>
-                    {events.filter((e) => !e.placed && visibleEventsFilter(e)).length === 0 && (
-                      <div className="text-xs text-gray-500">אין פתקים ממתינים (או שלא נמצאו בחיפוש/פילטרים)</div>
-                    )}
-                    <div className={`grid gap-2 ${GRID_COLS_CLASS[notesBankColumns] || "grid-cols-1"}`}>
-                    {events.filter((e) => !e.placed).filter(visibleEventsFilter).map((e) => (
-                      <div
-                        key={e.id}
-                        className="p-2 rounded mb-2 relative text-right"
-                        style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
-                        draggable
-                        onDragStart={(ev) => {
-                          ev.dataTransfer.setData("text/event-id", String(e.id));
-                          ev.dataTransfer.effectAllowed = "copyMove";
-                          setDraggedEventId(e.id);
-                        }}
-                        onDragEnd={() => setDraggedEventId(null)}
-                        dir="rtl"
-                      >
-                        <div className="absolute top-1 left-1">
-                          <button
-                            type="button"
-                            className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
-                            style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
-                            title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
-                            onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
-                          >
-                            {e.confirmed ? "✓" : ""}
-                          </button>
-                        </div>
-                        <div className="absolute top-1 right-1 flex gap-1">
-                          <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
-                          <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
-                        </div>
-                        <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
-                        <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
-                        {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
-                        <AudienceBadges audiences={e.audiences} />
-                      </div>
-                    ))}
-                    </div>
-                  </>
-                ) : (
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-xs text-gray-600">{events.filter(visibleEventsFilter).length} פעילויות</div>
-                      <select className="border p-1 text-xs" value={libraryGroupBy} onChange={(e) => setLibraryGroupBy(e.target.value)}>
-                        <option value="category">קבץ לפי קטגוריה</option>
-                        <option value="audience">קבץ לפי קהל יעד</option>
-                        <option value="price">קבץ לפי מחיר</option>
-                      </select>
-                    </div>
-                    {events.filter(visibleEventsFilter).length === 0 && (
-                      <div className="text-xs text-gray-500">לא נמצאו פעילויות (בדוק/י את הפילטרים)</div>
-                    )}
-                    {buildLibraryGroups().map((group) => group.items.length > 0 && (
-                      <div key={group.key} className="mb-3">
-                        <div className="text-xs font-semibold mb-1 flex items-center gap-2">
-                          <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: group.color }} />
-                          {group.label} ({group.items.length})
-                        </div>
-                        <div className={`grid gap-2 ${GRID_COLS_CLASS[notesBankColumns] || "grid-cols-1"}`}>
-                        {group.items.map((e) => (
-                          <div
-                            key={e.id}
-                            className="p-2 rounded mb-2 relative text-right cursor-grab"
-                            style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
-                            draggable
-                            onDragStart={(ev) => {
-                              ev.dataTransfer.setData("text/event-id", String(e.id));
-                              ev.dataTransfer.effectAllowed = "copyMove";
-                              setDraggedEventId(e.id);
-                            }}
-                            onDragEnd={() => setDraggedEventId(null)}
-                            dir="rtl"
-                            title="גרור/י ליומן כדי למקם או להזיז"
-                          >
-                            <div className="absolute top-1 left-1">
-                              <button
-                                type="button"
-                                className="w-4 h-4 rounded-full border flex items-center justify-center text-[10px]"
-                                style={{ background: e.confirmed ? "#16a34a" : "white", color: e.confirmed ? "white" : "#16a34a", borderColor: "#16a34a" }}
-                                title={e.confirmed ? "אירוע סופי (לחץ לביטול)" : "סמן כסופי"}
-                                onClick={(ev) => { ev.stopPropagation(); toggleConfirmed(e.id); }}
-                              >
-                                {e.confirmed ? "✓" : ""}
-                              </button>
-                            </div>
-                            <div className="absolute top-1 right-1 flex gap-1">
-                              <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
-                              <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
-                            </div>
-                            <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
-                            <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
-                            <div className="text-[11px] text-gray-700 mt-1">
-                              {e.placed && e.dayIndex != null && e.time ? `ממוקם: יום ${e.dayIndex + 1} • ${e.time}` : "לא ממוקם"}
-                            </div>
-                            {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
-                            <AudienceBadges audiences={e.audiences} />
-                          </div>
-                        ))}
-                        </div>
-                      </div>
-                    ))}
+                {armedEvent && (
+                  <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-400 text-amber-900 text-xs rounded px-2 py-1.5 mb-2" dir="rtl">
+                    <span>📌 מסומן: <b>{armedEvent.title || "ללא כותרת"}</b> — לחצ/י על משבצת בלוח</span>
+                    <button className="border border-amber-500 rounded px-1.5" onClick={() => { setArmedEventId(null); broadcastArm({ type: "clear-armed" }); }}>ביטול</button>
                   </div>
                 )}
+
+                {notesBankTabs}
               </div>
             </aside>
           </>
@@ -1521,60 +1783,7 @@ export default function InteractiveSchedule() {
       )}
 
       {/* Edit Event modal */}
-      {selectedEvent && (
-        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setSelectedEventId(null)}>
-          <div className="bg-white rounded-xl shadow-xl w-[480px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
-            <div className="flex items-center justify-between border-b p-3">
-              <div className="font-bold">עריכת אירוע</div>
-              <button className="px-3 py-1" onClick={() => setSelectedEventId(null)}>סגור ✕</button>
-            </div>
-            <div className="max-h-[80vh] overflow-auto p-4">
-              <label className="block text-sm mb-1">שם האירוע</label>
-              <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.title} onChange={(e) => updateSelectedEvent({ title: e.target.value })} />
-
-              <label className="block text-sm mb-1">משך</label>
-              <select className="border p-1 w-full mb-2" value={selectedEvent.duration} onChange={(e) => updateSelectedEvent({ duration: Number(e.target.value) })}>
-                {DURATIONS.map((m) => (<option key={m} value={m}>{durationLabel(m)}</option>))}
-              </select>
-
-              <label className="block text-sm mb-1">עלות (רכיבים)</label>
-              <div className="mb-2">
-                <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
-              </div>
-
-              <label className="block text-sm mb-1">איש קשר</label>
-              <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
-
-              <label className="block text-sm mb-1">טלפון איש קשר</label>
-              <input type="tel" className="border p-1 w-full mb-2" value={selectedEvent.contactPhone || ""} onChange={(e) => updateSelectedEvent({ contactPhone: e.target.value })} />
-
-              <label className="block text-sm mb-1">ארגון</label>
-              <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.organization || ""} onChange={(e) => updateSelectedEvent({ organization: e.target.value })} />
-
-              <label className="block text-sm mb-1">תיאור</label>
-              <textarea className="border p-1 w-full h-20 mb-3" value={selectedEvent.description || ""} onChange={(e) => updateSelectedEvent({ description: e.target.value })} />
-
-              <label className="block text-sm mb-1">קטגוריה</label>
-              <select className="border p-1 w-full mb-3" value={selectedEvent.categoryKey || "general"} onChange={(e) => updateSelectedEvent({ categoryKey: e.target.value })}>
-                {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
-              </select>
-
-              <label className="block text-sm mb-1">קהל יעד</label>
-              <div className="mb-3">
-                <AudienceCheckboxes selected={selectedEvent.audiences} onChange={(audiences) => updateSelectedEvent({ audiences })} />
-              </div>
-
-              <div className="text-xs text-gray-600 mb-2">
-                {selectedEvent.placed && selectedEvent.dayIndex != null && selectedEvent.time ? `ממוקם: יום ${selectedEvent.dayIndex + 1} • ${selectedEvent.time}` : "עדיין לא ננעץ בלוח"}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button className="bg-indigo-600 text-white px-3 py-1 rounded" onClick={() => setSelectedEventId(null)}>סיום עריכה</button>
-                <button className="bg-red-600 text-white px-3 py-1 rounded" onClick={() => deleteEvent(selectedEvent.id)}>מחק אירוע</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      {editEventModal}
 
       {/* Totals modal */}
       {showTotalsModal && (
@@ -1693,7 +1902,13 @@ export default function InteractiveSchedule() {
                   style={{ height: timeSlots.length * SLOT_PX, backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.08) 1px, transparent 1px)`, backgroundSize: `100% ${SLOT_PX}px` }}
                   onClick={(ev) => {
                     const time = timeFromClientY(ev.currentTarget, ev.clientY);
-                    placeEventExact(zoomDay, time);
+                    if (armedEventId) {
+                      placeEventExact(zoomDay, time, armedEventId);
+                      setArmedEventId(null);
+                      broadcastArm({ type: "clear-armed" });
+                    } else {
+                      placeEventExact(zoomDay, time);
+                    }
                   }}
                   onDragOver={(ev) => {
                     ev.preventDefault();
@@ -1740,6 +1955,7 @@ export default function InteractiveSchedule() {
                         </button>
                       </div>
 <div className="absolute top-1 right-1 flex gap-1">
+                          <button title="החזר לבנק" className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); sendToBank(e.id); }}>📥</button>
                           <button title="עריכה" className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); setSelectedEventId(e.id); }}>✎</button>
                           <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                         </div>
