@@ -390,17 +390,56 @@ function CostItemsEditor({ items, onChange }) {
 
 // Shared "for website / for social" tag checkboxes, used by both images and videos — not
 // mutually exclusive, since the same file can serve both purposes.
+// Soft aspect-ratio guidance only — no cropping. Website content generally reads better wide
+// (banner-style), social feeds better square/portrait. If an uploaded image's actual shape
+// (captured at upload time, see readImageDimensions) doesn't roughly match a role it's tagged
+// for, a warning is shown so the source photo can be prepared/cropped before using it there.
+const RATIO_GUIDANCE = {
+  forWebsite: { min: 1.3, max: 2.2, label: "מומלץ תמונה רחבה (יחס כ-16:9)", tooNarrow: "אנכית/צרה מדי", tooWide: "רחבה מדי" },
+  forSocial: { min: 0.75, max: 1.05, label: "מומלץ תמונה מרובעת או פורטרט (יחס כ-1:1 עד 4:5)", tooNarrow: "אנכית מדי", tooWide: "רחבה מדי" },
+};
+
+function ratioWarning(item, role) {
+  if (!item.width || !item.height) return null;
+  const ratio = item.width / item.height;
+  const g = RATIO_GUIDANCE[role];
+  if (ratio >= g.min && ratio <= g.max) return null;
+  return ratio > g.max ? g.tooWide : g.tooNarrow;
+}
+
+function readImageDimensions(file) {
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      URL.revokeObjectURL(objectUrl);
+    };
+    img.onerror = () => {
+      resolve({ width: null, height: null });
+      URL.revokeObjectURL(objectUrl);
+    };
+    img.src = objectUrl;
+  });
+}
+
 function MediaRoleCheckboxes({ item, onChange }) {
+  const websiteWarning = item.forWebsite && ratioWarning(item, "forWebsite");
+  const socialWarning = item.forSocial && ratioWarning(item, "forSocial");
   return (
-    <div className="flex gap-3 text-[11px] mt-1">
-      <label className="flex items-center gap-1">
-        <input type="checkbox" checked={!!item.forWebsite} onChange={(e) => onChange({ ...item, forWebsite: e.target.checked })} />
-        לאתר
-      </label>
-      <label className="flex items-center gap-1">
-        <input type="checkbox" checked={!!item.forSocial} onChange={(e) => onChange({ ...item, forSocial: e.target.checked })} />
-        לרשתות חברתיות
-      </label>
+    <div className="text-[11px] mt-1">
+      <div className="flex gap-3">
+        <label className="flex items-center gap-1">
+          <input type="checkbox" checked={!!item.forWebsite} onChange={(e) => onChange({ ...item, forWebsite: e.target.checked })} />
+          לאתר
+        </label>
+        <label className="flex items-center gap-1">
+          <input type="checkbox" checked={!!item.forSocial} onChange={(e) => onChange({ ...item, forSocial: e.target.checked })} />
+          לרשתות חברתיות
+        </label>
+      </div>
+      {websiteWarning && <div className="text-amber-700 mt-0.5">⚠ {websiteWarning} לאתר — {RATIO_GUIDANCE.forWebsite.label}</div>}
+      {socialWarning && <div className="text-amber-700 mt-0.5">⚠ {socialWarning} לרשתות — {RATIO_GUIDANCE.forSocial.label}</div>}
     </div>
   );
 }
@@ -420,8 +459,8 @@ function ImagesEditor({ items, onChange }) {
     setUploading(true);
     setError("");
     try {
-      const url = await uploadMedia("activity-images", file);
-      onChange([...list, { id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, url, forWebsite: false, forSocial: false }]);
+      const [url, dims] = await Promise.all([uploadMedia("activity-images", file), readImageDimensions(file)]);
+      onChange([...list, { id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, url, forWebsite: false, forSocial: false, width: dims.width, height: dims.height, credit: "" }]);
     } catch (err) {
       setError("שגיאה בהעלאת התמונה: " + err.message);
     } finally {
@@ -434,7 +473,7 @@ function ImagesEditor({ items, onChange }) {
     <div>
       <div className="flex flex-wrap gap-2 mb-2">
         {list.map((item) => (
-          <div key={item.id} className="border rounded p-1.5 w-28">
+          <div key={item.id} className="border rounded p-1.5 w-32">
             <div className="relative">
               <img src={item.url} alt="" className="w-full h-20 object-cover rounded" />
               <button
@@ -447,10 +486,19 @@ function ImagesEditor({ items, onChange }) {
               </button>
             </div>
             <MediaRoleCheckboxes item={item} onChange={(patch) => updateItem(item.id, patch)} />
+            <input
+              type="text"
+              className="border rounded text-[10px] px-1 py-0.5 w-full mt-1"
+              placeholder="קרדיט לצילום"
+              title="קרדיט לצלם/ת — יוצג בעיקר באתר"
+              value={item.credit || ""}
+              onChange={(e) => updateItem(item.id, { credit: e.target.value })}
+            />
           </div>
         ))}
       </div>
       <input type="file" accept="image/*" onChange={handleFile} disabled={uploading} className="text-xs block" />
+      <div className="text-[10px] text-gray-500 mt-1">💡 {RATIO_GUIDANCE.forWebsite.label} · {RATIO_GUIDANCE.forSocial.label}</div>
       {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
       {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
     </div>
