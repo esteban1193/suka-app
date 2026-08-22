@@ -2098,6 +2098,12 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                         <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                       </div>
                       <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
+                      {(Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) ? (
+                        <div className="px-2 text-[10px] leading-none">
+                          {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
+                          {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                        </div>
+                      ) : null}
                       {e.organization && (
                         <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[10rem]">ארגון: {e.organization}</div>
                       )}
@@ -2489,6 +2495,12 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                         </div>
                         <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
+                      {(Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) ? (
+                        <div className="px-2 text-[10px] leading-none">
+                          {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
+                          {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                        </div>
+                      ) : null}
                         {e.organization && (
                           <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[12rem]">ארגון: {e.organization}</div>
                         )}
