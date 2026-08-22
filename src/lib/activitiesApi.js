@@ -1,5 +1,16 @@
 import { supabase } from "./supabaseClient";
 
+// Uploads a file to the given bucket ("activity-images" or "activity-videos") and returns its
+// public URL. Filenames are randomized to avoid collisions between different activities.
+export async function uploadMedia(bucket, file) {
+  const ext = file.name.includes(".") ? file.name.split(".").pop() : "bin";
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const { error } = await supabase.storage.from(bucket).upload(path, file);
+  if (error) throw error;
+  const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+  return data.publicUrl;
+}
+
 // DB row (snake_case) -> app event shape (camelCase) — matches the shape App.jsx already uses
 export function rowToEvent(row) {
   return {
@@ -10,6 +21,7 @@ export function rowToEvent(row) {
     audiences: row.audiences || [],
     costItems: row.cost_items || [],
     description: row.description,
+    summary: row.summary,
     contact: row.contact,
     contactPhone: row.contact_phone,
     organization: row.organization,
@@ -17,8 +29,8 @@ export function rowToEvent(row) {
     placed: row.placed,
     dayIndex: row.day_index,
     time: row.time,
-    imageUrl: row.image_url,
-    videoUrl: row.video_url,
+    images: row.images || [],
+    videos: row.videos || [],
   };
 }
 
@@ -29,6 +41,7 @@ const FIELD_MAP = {
   audiences: "audiences",
   costItems: "cost_items",
   description: "description",
+  summary: "summary",
   contact: "contact",
   contactPhone: "contact_phone",
   organization: "organization",
@@ -36,8 +49,8 @@ const FIELD_MAP = {
   placed: "placed",
   dayIndex: "day_index",
   time: "time",
-  imageUrl: "image_url",
-  videoUrl: "video_url",
+  images: "images",
+  videos: "videos",
 };
 
 // Columns that are NOT NULL in the schema, with the same default the column itself uses.
@@ -51,11 +64,14 @@ const NOT_NULL_DEFAULTS = {
   audiences: [],
   costItems: [],
   description: "",
+  summary: "",
   contact: "",
   contactPhone: "",
   organization: "",
   confirmed: false,
   placed: false,
+  images: [],
+  videos: [],
 };
 
 // app event shape -> full DB row (every column, with defaults applied) — for INSERT, where every
@@ -124,8 +140,15 @@ export async function insertActivities(events) {
 }
 
 export async function updateActivityFields(id, patch) {
-  const { error } = await supabase.from("activities").update(patchToRow(patch)).eq("id", id);
+  // .select("id") forces PostgREST to return the rows it actually touched. Without it, an
+  // .eq("id", id) that matches zero rows (e.g. a locally-held id that no longer exists in the
+  // table, such as after a past duplicate/re-import incident) succeeds silently with no error —
+  // the write looks fine to the caller but nothing was actually saved.
+  const { data, error } = await supabase.from("activities").update(patchToRow(patch)).eq("id", id).select("id");
   if (error) throw error;
+  if (!data || data.length === 0) {
+    throw new Error(`לא נמצאה בענן שורה עם id=${id} — הפעולה לא נשמרה (ה-id המקומי כנראה לא תואם למסד הנתונים).`);
+  }
 }
 
 export async function deleteActivityById(id) {

@@ -1,0 +1,21 @@
+-- Second id-type fix (see 001_fix_activities_id_type_ONEOFF.sql for the first, uuid -> double
+-- precision). The app generates ids as `Date.now() + Math.random()` — a 13-digit integer plus a
+-- long random fraction needs far more decimal digits than a `double precision` (~15-17
+-- significant digits total) can hold, so precision is lost the instant an id is created, and can
+-- drift further on each JSON round-trip between the browser and Postgres. The practical result:
+-- an id that LOOKS identical in the browser and in the database can be a different underlying
+-- value, so `.eq("id", id)` silently matches zero rows — an update/delete reports success but
+-- changes nothing. Confirmed via a stuck event whose updated_at never advanced despite repeated
+-- successful-looking saves.
+--
+-- Fix: move `id` to `text`. `using id::text` casts each row's CURRENT precise stored value (not
+-- whatever imprecise copy any browser tab happens to hold), so this migration alone self-heals
+-- every row's true id — no manual data repair needed. App code switches to generating string ids
+-- (e.g. `${Date.now()}-${Math.random().toString(36).slice(2,10)}`, the same pattern already used
+-- for image/video sub-item ids) in the same deploy as this migration.
+--
+-- IMPORTANT ORDERING: run this BEFORE deploying the code change that switches id generation to
+-- strings — a `double precision` column would reject a non-numeric string id outright, while a
+-- `text` column accepts a numeric id from the old (currently-live) code without issue during the
+-- brief gap between running this and the new code going live.
+alter table activities alter column id type text using id::text;

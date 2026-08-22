@@ -3,18 +3,24 @@
 -- Safe to re-run: every statement is idempotent (IF NOT EXISTS / OR REPLACE / DROP...CREATE).
 
 -- ===== Activities (replaces the old localStorage "events" array) =====
--- id is `double precision`, NOT uuid: the app generates ids client-side as
--- `Date.now() + Math.random()` (a JS float, exactly representable as Postgres double precision)
--- everywhere — addEvent, placing a copy, Excel import, etc. Matching that avoids having to touch
--- id generation throughout the app just to satisfy the database.
+-- id is `text`, NOT uuid or a numeric type: the app generates ids client-side as
+-- `${Date.now()}-${Math.random().toString(36).slice(2,10)}` everywhere — addEvent, placing a
+-- copy, Excel import, etc. An earlier version used `double precision` with plain
+-- `Date.now() + Math.random()` ids, but a 13-digit timestamp plus a long random fraction needs
+-- more decimal digits than a double can hold, so precision was lost the instant an id was
+-- created (and could drift further on each JSON round-trip) — two ids that displayed identically
+-- could be different underlying values, making `.eq("id", ...)` silently match zero rows. See
+-- supabase/007_fix_activities_id_type_text.sql for the migration that fixed this on production.
 create table if not exists activities (
-  id double precision primary key,
+  id text primary key,
   title text not null default '',
   duration integer not null default 30,
   category_key text not null default 'general',
   audiences text[] not null default '{}',
   cost_items jsonb not null default '[]',
   description text not null default '',
+  -- Short excerpt for the website's event listing — see supabase/006_add_summary.sql.
+  summary text not null default '',
   contact text not null default '',
   contact_phone text not null default '',
   organization text not null default '',
@@ -22,8 +28,10 @@ create table if not exists activities (
   placed boolean not null default false,
   day_index integer,
   time text,
-  image_url text,
-  video_url text,
+  -- Each item: {id, url, forWebsite, forSocial} — see supabase/005_multi_media.sql for the
+  -- migration that replaced the original single image_url/video_url columns with these.
+  images jsonb not null default '[]',
+  videos jsonb not null default '[]',
   created_by uuid references auth.users(id),
   updated_by uuid references auth.users(id),
   created_at timestamptz not null default now(),

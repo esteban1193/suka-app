@@ -4,7 +4,7 @@ import {
   fetchActivities, fetchCategories, fetchStartDate, updateStartDate,
   insertActivity, insertActivities, updateActivityFields, deleteActivityById,
   insertCategory, updateCategory, deleteCategoryByKey, reassignEventsCategory,
-  syncActivities, syncCategories,
+  syncActivities, syncCategories, uploadMedia,
 } from "./lib/activitiesApi";
 // xlsx is ~500KB — loaded on demand (only when the template/import buttons are used)
 // instead of in the main bundle, via dynamic import() inside the functions that need it.
@@ -297,11 +297,23 @@ const eventTotal = (e) => {
 // One-time upgrade for events saved before cost items existed: turn a legacy single `price`
 // into a proper cost line item so it's visible/editable in the cost breakdown editor.
 const migrateEvent = (e) => {
-  if (Array.isArray(e.costItems) && e.costItems.length > 0) return e;
-  if (typeof e.price === "number" && e.price > 0) {
-    return { ...e, costItems: [{ id: `${e.id}-legacy-price`, label: "מחיר", amount: String(e.price), vat: false }] };
+  let out = e;
+  if (!(Array.isArray(out.costItems) && out.costItems.length > 0)) {
+    if (typeof out.price === "number" && out.price > 0) {
+      out = { ...out, costItems: [{ id: `${out.id}-legacy-price`, label: "מחיר", amount: String(out.price), vat: false }] };
+    } else if (!Array.isArray(out.costItems)) {
+      out = { ...out, costItems: [] };
+    }
   }
-  return Array.isArray(e.costItems) ? e : { ...e, costItems: [] };
+  // Brief window where images/videos were single fields (imageUrl/videoUrl) instead of arrays —
+  // promotes any such legacy value so an old exported JSON from that time still imports cleanly.
+  if (!Array.isArray(out.images)) {
+    out = { ...out, images: out.imageUrl ? [{ id: `${out.id}-legacy-image`, url: out.imageUrl, forWebsite: false, forSocial: false }] : [] };
+  }
+  if (!Array.isArray(out.videos)) {
+    out = { ...out, videos: out.videoUrl ? [{ id: `${out.id}-legacy-video`, url: out.videoUrl, forWebsite: false, forSocial: false }] : [] };
+  }
+  return out;
 };
 const normalizeOrg = (s) => (s && s.trim()) ? s.trim() : "ללא ארגון";
 const triggerJsonDownload = (payload, filename) => {
@@ -376,6 +388,140 @@ function CostItemsEditor({ items, onChange }) {
   );
 }
 
+// Shared "for website / for social" tag checkboxes, used by both images and videos — not
+// mutually exclusive, since the same file can serve both purposes.
+function MediaRoleCheckboxes({ item, onChange }) {
+  return (
+    <div className="flex gap-3 text-[11px] mt-1">
+      <label className="flex items-center gap-1">
+        <input type="checkbox" checked={!!item.forWebsite} onChange={(e) => onChange({ ...item, forWebsite: e.target.checked })} />
+        לאתר
+      </label>
+      <label className="flex items-center gap-1">
+        <input type="checkbox" checked={!!item.forSocial} onChange={(e) => onChange({ ...item, forSocial: e.target.checked })} />
+        לרשתות חברתיות
+      </label>
+    </div>
+  );
+}
+
+// Multiple images per activity, each uploaded separately and taggable for website/social use.
+function ImagesEditor({ items, onChange }) {
+  const list = Array.isArray(items) ? items : [];
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const updateItem = (id, patch) => onChange(list.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  const removeItem = (id) => onChange(list.filter((it) => it.id !== id));
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    try {
+      const url = await uploadMedia("activity-images", file);
+      onChange([...list, { id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, url, forWebsite: false, forSocial: false }]);
+    } catch (err) {
+      setError("שגיאה בהעלאת התמונה: " + err.message);
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
+  return (
+    <div>
+      <div className="flex flex-wrap gap-2 mb-2">
+        {list.map((item) => (
+          <div key={item.id} className="border rounded p-1.5 w-28">
+            <div className="relative">
+              <img src={item.url} alt="" className="w-full h-20 object-cover rounded" />
+              <button
+                type="button"
+                className="absolute -top-1.5 -right-1.5 bg-red-600 text-white rounded-full w-5 h-5 text-xs leading-5"
+                onClick={() => removeItem(item.id)}
+                title="הסר תמונה"
+              >
+                ✕
+              </button>
+            </div>
+            <MediaRoleCheckboxes item={item} onChange={(patch) => updateItem(item.id, patch)} />
+          </div>
+        ))}
+      </div>
+      <input type="file" accept="image/*" onChange={handleFile} disabled={uploading} className="text-xs block" />
+      {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
+      {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+    </div>
+  );
+}
+
+// Multiple videos per activity — each entry is either a pasted URL (YouTube etc., avoids using
+// storage) or an uploaded file, tagged the same way as images.
+function VideosEditor({ items, onChange }) {
+  const list = Array.isArray(items) ? items : [];
+  const [urlInput, setUrlInput] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const updateItem = (id, patch) => onChange(list.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  const removeItem = (id) => onChange(list.filter((it) => it.id !== id));
+
+  const addUrl = () => {
+    if (!urlInput.trim()) return;
+    onChange([...list, { id: `vid-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, url: urlInput.trim(), forWebsite: false, forSocial: false }]);
+    setUrlInput("");
+  };
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    try {
+      const url = await uploadMedia("activity-videos", file);
+      onChange([...list, { id: `vid-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, url, forWebsite: false, forSocial: false }]);
+    } catch (err) {
+      setError("שגיאה בהעלאת הוידאו: " + err.message);
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
+  return (
+    <div>
+      {list.map((item) => (
+        <div key={item.id} className="border rounded p-1.5 mb-1.5">
+          <div className="flex items-center gap-1">
+            <a href={item.url} target="_blank" rel="noreferrer" className="text-xs text-blue-700 truncate flex-1" dir="ltr" title={item.url}>
+              {item.url}
+            </a>
+            <button type="button" className="text-red-600 text-xs px-1" onClick={() => removeItem(item.id)} title="הסר">✕</button>
+          </div>
+          <MediaRoleCheckboxes item={item} onChange={(patch) => updateItem(item.id, patch)} />
+        </div>
+      ))}
+      <div className="flex items-center gap-1 mb-1">
+        <input
+          type="text"
+          placeholder="קישור לוידאו (יוטיוב וכו')"
+          className="border p-1 flex-1 text-sm"
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+          dir="ltr"
+        />
+        <button type="button" className="text-xs border rounded px-2 py-1" onClick={addUrl}>+ הוסף</button>
+      </div>
+      <div className="text-xs text-gray-500 mb-1">או העלאת קובץ וידאו (קבצים גדולים עלולים להיכשל בהעלאה):</div>
+      <input type="file" accept="video/*" onChange={handleFile} disabled={uploading} className="text-xs block" />
+      {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
+      {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+    </div>
+  );
+}
+
 /** Calculate time from Y position inside day column */
 const timeFromClientY = (container, clientY) => {
   const rect = container.getBoundingClientRect();
@@ -398,13 +544,23 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     categoryKey: "general",
     audiences: [],
     description: "",
+    summary: "",
     contact: "",
     phone: "",
     organization: "",
+    images: [],
+    videos: [],
   });
   const [draggedEventId, setDraggedEventId] = useState(null);
   const [selectedEventId, setSelectedEventId] = useState(null);
   const [conflictMsg, setConflictMsg] = useState("");
+  // Transient "saved" confirmation for every cloud write — separate from conflictMsg (which is
+  // reused for errors/import summaries and doesn't auto-clear). Added to diagnose a bug where an
+  // uploaded image appeared locally but wasn't actually persisted to Supabase: since edit happens
+  // inside a full-screen modal (z-50) and conflictMsg only rendered inline in the toolbar
+  // underneath it, any error fired while a modal was open was invisible until the modal closed.
+  const [cloudFlash, setCloudFlash] = useState(null); // { type: "ok" | "err", msg: string } | null
+  const cloudFlashTimerRef = useRef(null);
   const [startDate, setStartDate] = useState(() => {
     const today = new Date();
     const y = today.getFullYear();
@@ -434,6 +590,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
   const [realtimeStatus, setRealtimeStatus] = useState("מתחבר...");
   const [lastRealtimeEvent, setLastRealtimeEvent] = useState("");
+  const [backupInProgress, setBackupInProgress] = useState(false);
   const [duplicateIdsToDelete, setDuplicateIdsToDelete] = useState(() => new Set());
   const [autoBackupEnabled, setAutoBackupEnabled] = useState(false);
   const [autoBackupIntervalMin, setAutoBackupIntervalMin] = useState(10);
@@ -522,13 +679,24 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   // currently in flight; while > 0, an incoming Realtime event is ignored instead of refetching
   // and overwriting local state, which would otherwise revert a not-yet-saved local edit.
   const pendingWritesRef = useRef(0);
+  const flashCloudStatus = (type, msg) => {
+    clearTimeout(cloudFlashTimerRef.current);
+    setCloudFlash({ type, msg });
+    cloudFlashTimerRef.current = setTimeout(() => setCloudFlash(null), type === "ok" ? 2000 : 6000);
+  };
+
   const runCloudWrite = (fn) => {
     pendingWritesRef.current += 1;
     Promise.resolve()
       .then(fn)
+      .then(() => {
+        flashCloudStatus("ok", "✓ נשמר בענן");
+      })
       .catch((err) => {
         console.error(err);
-        setConflictMsg("שגיאה בשמירה לענן: " + err.message);
+        const msg = "שגיאה בשמירה לענן: " + err.message;
+        setConflictMsg(msg);
+        flashCloudStatus("err", msg);
       })
       .finally(() => {
         pendingWritesRef.current -= 1;
@@ -715,7 +883,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
 
   const addEvent = () => {
     if (!newEvent.title.trim()) return;
-    const id = Date.now() + Math.random();
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const created = { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed };
     setEvents((prev) => [...prev, created]);
     runCloudWrite(() => insertActivity(created));
@@ -727,10 +895,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       categoryKey: newEvent.categoryKey,
       audiences: [],
       description: "",
+      summary: "",
       contact: "",
       phone: "",
       organization: "",
       contactPhone: "",
+      images: [],
+      videos: [],
     });
   };
 
@@ -746,7 +917,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       return;
     }
     if (copy) {
-      const clone = { ...candidate, id: Date.now() + Math.random() };
+      const clone = { ...candidate, id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}` };
       setEvents((prev) => [...prev, clone]);
       runCloudWrite(() => insertActivity(clone));
     } else {
@@ -956,6 +1127,89 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     URL.revokeObjectURL(url);
   };
 
+  // Full offline backup: a single .zip download containing a real .xlsx export (every field,
+  // including summary/media links) plus every uploaded photo as an actual file, organized by
+  // event. Videos are left as links in the spreadsheet rather than downloaded, since they can be
+  // large and are often external URLs anyway.
+  const exportFullBackup = async () => {
+    setBackupInProgress(true);
+    setConflictMsg("מכין גיבוי מלא, נא להמתין...");
+    try {
+      const [XLSX, JSZipModule] = await Promise.all([import("xlsx"), import("jszip")]);
+      const JSZip = JSZipModule.default;
+      const zip = new JSZip();
+
+      const safeName = (s) => String(s || "").replace(/[\\/:*?"<>|]/g, "_").slice(0, 40) || "ללא_כותרת";
+
+      const headers = [
+        "כותרת", "תאריך", "מס׳ יום", "שעה", "משך (דק׳)", "קטגוריה", "קהל יעד", "עלות כוללת", "פירוט עלות",
+        "תיאור", "תקציר", "איש קשר", "טלפון", "ארגון", "נעוץ", "סופי", "קישורי וידאו", "קבצי תמונה מצורפים",
+      ];
+
+      const rows = [];
+      let imageCount = 0;
+      for (const e of events) {
+        const date = e.dayIndex != null ? days[e.dayIndex]?.dateKey || "" : "";
+        const catName = catByKey[e.categoryKey]?.name || "כללי";
+        const audienceNames = (Array.isArray(e.audiences) ? e.audiences : []).map(audienceLabel).join("; ");
+        const costBreakdown = (Array.isArray(e.costItems) ? e.costItems : [])
+          .filter((ci) => ci.label || ci.amount)
+          .map((ci) => `${ci.label || "רכיב"}: ₪${resolveAmount(ci)}${ci.vat ? " (כולל מע\"מ)" : ""}`)
+          .join("; ");
+        const videoLinks = (Array.isArray(e.videos) ? e.videos : []).map((v) => v.url).join("; ");
+
+        const imageFileNames = [];
+        const images = Array.isArray(e.images) ? e.images : [];
+        for (let i = 0; i < images.length; i++) {
+          const img = images[i];
+          try {
+            const resp = await fetch(img.url);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const blob = await resp.blob();
+            const ext = (img.url.split(".").pop() || "jpg").split("?")[0];
+            const fileName = `${safeName(e.title)}_${i + 1}.${ext}`;
+            zip.file(`images/${safeName(e.title)}_${e.id}/${fileName}`, blob);
+            imageFileNames.push(fileName);
+            imageCount++;
+          } catch (err) {
+            console.error("Failed to fetch image for backup:", img.url, err);
+            imageFileNames.push(`(שגיאה בהורדה: ${img.url})`);
+          }
+        }
+
+        rows.push([
+          e.title ?? "", date, e.dayIndex != null ? e.dayIndex + 1 : "", e.time ?? "", e.duration ?? "",
+          catName, audienceNames, eventTotal(e), costBreakdown,
+          e.description ?? "", e.summary ?? "", e.contact ?? "", (e.contactPhone || e.phone || ""),
+          e.organization ?? "", e.placed ? 1 : 0, e.confirmed ? "כן" : "לא",
+          videoLinks, imageFileNames.join("; "),
+        ]);
+      }
+
+      const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+      ws["!cols"] = headers.map(() => ({ wch: 18 }));
+      const wb = XLSX.utils.book_new();
+      wb.Workbook = { Views: [{ RTL: true }] };
+      XLSX.utils.book_append_sheet(wb, ws, "לוח פעילויות");
+      const xlsxData = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+      zip.file("לוח_פעילויות.xlsx", xlsxData);
+
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `suka-backup-${formatTimestampForFilename(new Date())}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setConflictMsg(`הגיבוי המלא ירד בהצלחה: ${events.length} אירועים, ${imageCount} תמונות.`);
+    } catch (err) {
+      console.error(err);
+      setConflictMsg("שגיאה ביצירת הגיבוי המלא: " + err.message);
+    } finally {
+      setBackupInProgress(false);
+    }
+  };
+
   // Import (paste)
   const importJSON = () => {
     try {
@@ -1076,7 +1330,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
         const validTime = timeSlots.includes(time);
 
         const base = {
-          id: Date.now() + Math.random() + idx,
+          id: `${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 10)}`,
           title,
           duration,
           categoryKey,
@@ -1444,6 +1698,16 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
           </div>
 
+          <label className="block text-sm mb-1">תמונות</label>
+          <div className="mb-2">
+            <ImagesEditor items={selectedEvent.images} onChange={(images) => updateSelectedEvent({ images })} />
+          </div>
+
+          <label className="block text-sm mb-1">וידאו</label>
+          <div className="mb-2">
+            <VideosEditor items={selectedEvent.videos} onChange={(videos) => updateSelectedEvent({ videos })} />
+          </div>
+
           <label className="block text-sm mb-1">איש קשר</label>
           <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
 
@@ -1455,6 +1719,9 @@ export default function InteractiveSchedule({ session, onSignOut }) {
 
           <label className="block text-sm mb-1">תיאור</label>
           <textarea className="border p-1 w-full h-20 mb-3" value={selectedEvent.description || ""} onChange={(e) => updateSelectedEvent({ description: e.target.value })} />
+
+          <label className="block text-sm mb-1">תקציר <span className="text-gray-400 font-normal">(לניהול אירועים באתר)</span></label>
+          <textarea className="border p-1 w-full h-14 mb-3" value={selectedEvent.summary || ""} onChange={(e) => updateSelectedEvent({ summary: e.target.value })} />
 
           <label className="block text-sm mb-1">קטגוריה</label>
           <select className="border p-1 w-full mb-3" value={selectedEvent.categoryKey || "general"} onChange={(e) => updateSelectedEvent({ categoryKey: e.target.value })}>
@@ -1484,6 +1751,15 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   if (isPopout) {
     return (
       <div className="p-3" dir="rtl">
+        {cloudFlash && (
+          <div
+            className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border ${
+              cloudFlash.type === "ok" ? "bg-green-50 text-green-800 border-green-300" : "bg-red-50 text-red-800 border-red-300"
+            }`}
+          >
+            {cloudFlash.msg}
+          </div>
+        )}
         <div className="flex items-center justify-between mb-2">
           <h1 className="font-bold text-lg">בנק פתקים — {startDate}</h1>
           <a href={window.location.pathname} className="text-xs border rounded px-2 py-1">↩ תצוגה מלאה</a>
@@ -1508,6 +1784,17 @@ export default function InteractiveSchedule({ session, onSignOut }) {
 
   return (
     <div className="p-4 space-y-3 print:block print-page">
+      {/* Cloud save status toast — fixed + high z-index so it's visible even while the edit modal
+          (or any other modal, all z-50) is open on top of it. See cloudFlash/flashCloudStatus. */}
+      {cloudFlash && (
+        <div
+          className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border print:hidden ${
+            cloudFlash.type === "ok" ? "bg-green-50 text-green-800 border-green-300" : "bg-red-50 text-red-800 border-red-300"
+          }`}
+        >
+          {cloudFlash.msg}
+        </div>
+      )}
       {/* Top Bar */}
       <div className="flex flex-wrap items-center gap-3 print:hidden">
         <label className="text-sm">תאריך התחלה:
@@ -1633,6 +1920,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                 <button className="bg-gray-800 text-white px-3 py-1 rounded w-full" onClick={exportJSON}>ייצא JSON</button>
                 <button className="bg-gray-700 text-white px-3 py-1 rounded w-full" onClick={exportCSV}>ייצא CSV</button>
               </div>
+              <button
+                className="bg-indigo-700 text-white px-3 py-1 rounded w-full mb-2 disabled:opacity-60"
+                onClick={exportFullBackup}
+                disabled={backupInProgress}
+              >
+                {backupInProgress ? "מכין גיבוי..." : "📦 גיבוי מלא (אקסל + תמונות)"}
+              </button>
 
               {/* File import */}
               <label className="text-sm mb-2 block">ייבוא מקובץ JSON:</label>
@@ -1890,6 +2184,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
               <input type="tel" placeholder="טלפון איש קשר" className="border p-1 mb-2 w-full" value={newEvent.contactPhone || ""} onChange={(e) => setNewEvent({ ...newEvent, contactPhone: e.target.value })} />
               <input type="text" placeholder="ארגון" className="border p-1 mb-2 w-full" value={newEvent.organization} onChange={(e) => setNewEvent({ ...newEvent, organization: e.target.value })} />
               <textarea placeholder="תיאור" className="border p-1 mb-2 w-full h-16" value={newEvent.description} onChange={(e) => setNewEvent({ ...newEvent, description: e.target.value })} />
+              <textarea placeholder="תקציר (לניהול אירועים באתר)" className="border p-1 mb-2 w-full h-12" value={newEvent.summary} onChange={(e) => setNewEvent({ ...newEvent, summary: e.target.value })} />
               <select className="border p-1 mb-2 w-full" value={newEvent.categoryKey} onChange={(e) => setNewEvent({ ...newEvent, categoryKey: e.target.value })}>
                 {categories.map((c) => (<option key={c.key} value={c.key}>{c.name}</option>))}
               </select>
@@ -1900,6 +2195,14 @@ export default function InteractiveSchedule({ session, onSignOut }) {
               <div className="text-xs mb-1 text-gray-600">עלות (רכיבים):</div>
               <div className="mb-2">
                 <CostItemsEditor items={newEvent.costItems} onChange={(costItems) => setNewEvent({ ...newEvent, costItems })} />
+              </div>
+              <div className="text-xs mb-1 text-gray-600">תמונות:</div>
+              <div className="mb-2">
+                <ImagesEditor items={newEvent.images} onChange={(images) => setNewEvent({ ...newEvent, images })} />
+              </div>
+              <div className="text-xs mb-1 text-gray-600">וידאו:</div>
+              <div className="mb-2">
+                <VideosEditor items={newEvent.videos} onChange={(videos) => setNewEvent({ ...newEvent, videos })} />
               </div>
               <button
                 className="bg-green-600 text-white px-3 py-1 rounded w-full"
