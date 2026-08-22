@@ -1,4 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { supabase } from "./lib/supabaseClient";
+import {
+  fetchActivities, fetchCategories, fetchStartDate, updateStartDate,
+  insertActivity, insertActivities, updateActivityFields, deleteActivityById,
+  insertCategory, updateCategory, deleteCategoryByKey, reassignEventsCategory,
+  syncActivities, syncCategories,
+} from "./lib/activitiesApi";
 // xlsx is ~500KB — loaded on demand (only when the template/import buttons are used)
 // instead of in the main bundle, via dynamic import() inside the functions that need it.
 
@@ -380,7 +387,7 @@ const timeFromClientY = (container, clientY) => {
 /* =====================
    Component
    ===================== */
-export default function InteractiveSchedule() {
+export default function InteractiveSchedule({ session, onSignOut }) {
   const [events, setEvents] = useState([]);
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [newEvent, setNewEvent] = useState({
@@ -424,6 +431,10 @@ export default function InteractiveSchedule() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [showTotalsModal, setShowTotalsModal] = useState(false);
   const [showCategoriesModal, setShowCategoriesModal] = useState(false);
+  const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState("מתחבר...");
+  const [lastRealtimeEvent, setLastRealtimeEvent] = useState("");
+  const [duplicateIdsToDelete, setDuplicateIdsToDelete] = useState(() => new Set());
   const [autoBackupEnabled, setAutoBackupEnabled] = useState(false);
   const [autoBackupIntervalMin, setAutoBackupIntervalMin] = useState(10);
   const [lastBackupAt, setLastBackupAt] = useState("");
@@ -494,12 +505,35 @@ export default function InteractiveSchedule() {
   const notesStartX = useRef(0);
   const notesStartW = useRef(0);
 
-  // set right before applying a remote (other-window) schedule update, so the resulting
-  // re-render's auto-save effect doesn't immediately write the exact same data straight back
-  // (which would otherwise ping-pong a redundant storage event to the other window)
-  const suppressNextSaveRef = useRef(false);
-  // See the auto-save effect below — skips writing on the effect's very first invocation.
+  // See the UI-prefs auto-save effect below — skips writing on the effect's very first
+  // invocation (fires with default state before the localStorage load effect has applied).
   const isFirstAutoSaveRun = useRef(true);
+
+  // startDate still uses a "watch and save" effect (see below) since it's a single settings
+  // value, not a per-row table — this guard skips its first run (default state, before the
+  // initial cloud load lands) the same way the UI-prefs auto-save effect does.
+  const suppressStartDateSaveRef = useRef(false);
+  const isFirstStartDateSyncRun = useRef(true);
+
+  // Cloud writes to `activities`/`categories` are now targeted per action (insertActivity,
+  // updateActivityFields, deleteActivityById, etc. — see each mutation function below) rather
+  // than a blanket "watch state and save everything" effect, so two people editing at once never
+  // clobber each other's unrelated changes. This counter tracks how many such writes are
+  // currently in flight; while > 0, an incoming Realtime event is ignored instead of refetching
+  // and overwriting local state, which would otherwise revert a not-yet-saved local edit.
+  const pendingWritesRef = useRef(0);
+  const runCloudWrite = (fn) => {
+    pendingWritesRef.current += 1;
+    Promise.resolve()
+      .then(fn)
+      .catch((err) => {
+        console.error(err);
+        setConflictMsg("שגיאה בשמירה לענן: " + err.message);
+      })
+      .finally(() => {
+        pendingWritesRef.current -= 1;
+      });
+  };
 
   // ===== Resize event (change duration by dragging bottom edge) =====
   const [resizingInfo, setResizingInfo] = useState(null); // { id, startY, originalBlocks, startIdx, dayIndex }
@@ -560,6 +594,8 @@ export default function InteractiveSchedule() {
     };
     const onUp = () => {
       if (!resizingInfo) return;
+      const finalEvent = events.find((e) => e.id === resizingInfo.id);
+      if (finalEvent) runCloudWrite(() => updateActivityFields(resizingInfo.id, { duration: finalEvent.duration }));
       setResizingInfo(null);
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
@@ -573,12 +609,11 @@ export default function InteractiveSchedule() {
   }, [resizingInfo, events]);
 
   
-  // Full hydration (schedule data + this window's own UI prefs) — used once at mount.
+  // This window's own UI prefs only (panel widths, filters, column layout) — personal to this
+  // browser, loaded from localStorage. The actual schedule data (events/categories/startDate)
+  // now lives in Supabase; see the cloud load/sync effects below.
   const applyPersistedState = (data) => {
     if (!data || typeof data !== "object") return;
-    if (typeof data.startDate === "string") setStartDate(data.startDate);
-    if (Array.isArray(data.events)) setEvents(data.events.map(migrateEvent));
-    if (Array.isArray(data.categories)) setCategories(data.categories);
     if (typeof data.sidebarWidthPx === "number") setSidebarWidthPx(data.sidebarWidthPx);
     if (data.sidebarPos === "left" || data.sidebarPos === "right") setSidebarPos(data.sidebarPos);
     if (typeof data.notesBankOpen === "boolean") setNotesBankOpen(data.notesBankOpen);
@@ -595,39 +630,58 @@ export default function InteractiveSchedule() {
     if (typeof data.searchText === "string") setSearchText(data.searchText);
   };
 
-  // Partial hydration used for cross-window sync (see storage-event effect below) — only the
-  // actual shared schedule content, so each window (e.g. a popped-out notes bank on a second
-  // monitor) keeps its own independent panel widths/filters/column layout.
-  const applyRemoteScheduleState = (data) => {
-    if (!data || typeof data !== "object") return;
-    if (typeof data.startDate === "string") setStartDate(data.startDate);
-    if (Array.isArray(data.events)) setEvents(data.events.map(migrateEvent));
-    if (Array.isArray(data.categories)) setCategories(data.categories);
-  };
-
-  // ===== Load persisted state (once) =====
+  // ===== Load this window's UI prefs (once) =====
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) applyPersistedState(JSON.parse(raw));
     } catch (e) {
-      console.warn("Failed to load saved schedule:", e);
+      console.warn("Failed to load saved UI prefs:", e);
     }
   }, []);
 
-  // ===== Cross-window sync: pick up schedule changes made in another window/tab =====
+  // ===== Cloud: load schedule data from Supabase (once), then keep it live via Realtime =====
   useEffect(() => {
-    const onStorage = (e) => {
-      if (e.key !== STORAGE_KEY || !e.newValue) return;
+    (async () => {
       try {
-        suppressNextSaveRef.current = true;
-        applyRemoteScheduleState(JSON.parse(e.newValue));
+        const [acts, cats, sDate] = await Promise.all([fetchActivities(), fetchCategories(), fetchStartDate()]);
+        setEvents(acts.map(migrateEvent));
+        setCategories(cats.length > 0 ? cats : DEFAULT_CATEGORIES);
+        suppressStartDateSaveRef.current = true;
+        setStartDate(sDate);
       } catch (err) {
-        console.warn("Failed to sync schedule from another window:", err);
+        console.error(err);
+        setConflictMsg("שגיאה בטעינת הנתונים מהענן: " + err.message);
       }
-    };
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
+    })();
+  }, []);
+
+  // Realtime via "Broadcast from Database": a Postgres trigger (see supabase/003_broadcast_realtime.sql)
+  // explicitly broadcasts on every activities/categories write, rather than relying on the
+  // classic postgres_changes/logical-replication feed (which connected successfully but never
+  // actually delivered an event to any client, for reasons not yet root-caused). Both tables
+  // broadcast to the same "schedule-changes" topic; the payload's table name says which to refetch.
+  useEffect(() => {
+    const channel = supabase
+      .channel("schedule-changes", { config: { private: true } })
+      .on("broadcast", { event: "*" }, async (msg) => {
+        const table = msg.payload?.table;
+        setLastRealtimeEvent(`${msg.payload?.operation ?? msg.event} ${table ?? ""} @ ${new Date().toLocaleTimeString("he-IL")}`);
+        if (pendingWritesRef.current > 0) return; // a local change is still saving — don't clobber it
+        try {
+          if (table === "categories") {
+            const fresh = await fetchCategories();
+            setCategories(fresh.length > 0 ? fresh : DEFAULT_CATEGORIES);
+          } else {
+            const fresh = await fetchActivities();
+            setEvents(fresh.map(migrateEvent));
+          }
+        } catch (err) {
+          console.error("Failed to refresh after realtime broadcast:", err);
+        }
+      })
+      .subscribe((status) => setRealtimeStatus(status));
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
   const catByKey = useMemo(
@@ -662,10 +716,9 @@ export default function InteractiveSchedule() {
   const addEvent = () => {
     if (!newEvent.title.trim()) return;
     const id = Date.now() + Math.random();
-    setEvents((prev) => [
-      ...prev,
-      { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed },
-    ]);
+    const created = { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed };
+    setEvents((prev) => [...prev, created]);
+    runCloudWrite(() => insertActivity(created));
     setNewEvent({
       confirmed: false,
       title: "",
@@ -695,8 +748,10 @@ export default function InteractiveSchedule() {
     if (copy) {
       const clone = { ...candidate, id: Date.now() + Math.random() };
       setEvents((prev) => [...prev, clone]);
+      runCloudWrite(() => insertActivity(clone));
     } else {
       setEvents((prev) => prev.map((e) => (e.id === evToPlace.id ? candidate : e)));
+      runCloudWrite(() => updateActivityFields(evToPlace.id, { dayIndex, time, placed: true }));
     }
   };
 
@@ -727,6 +782,32 @@ export default function InteractiveSchedule() {
   const matchConfirmed = (e) => filterConfirmed === "all" || (filterConfirmed === "yes" && !!e.confirmed) || (filterConfirmed === "no" && !e.confirmed);
   const matchAudience = (e) => filterAudience === "all" || (Array.isArray(e.audiences) && e.audiences.includes(filterAudience));
   const visibleEventsFilter = (e) => matchCategory(e) && matchOrg(e) && matchConfirmed(e) && matchAudience(e) && searchMatch(e);
+
+  // Titles that already have a placed (scheduled) copy — used to flag likely duplicate
+  // unplaced notes in the bank (e.g. leftover from the earlier data-recovery import) so they
+  // can be reviewed and deleted manually, rather than auto-deleting anything automatically.
+  const placedTitles = useMemo(() => {
+    const set = new Set();
+    events.forEach((e) => { if (e.placed && e.title?.trim()) set.add(e.title.trim()); });
+    return set;
+  }, [events]);
+  const looksLikeDuplicate = (e) => !e.placed && e.title?.trim() && placedTitles.has(e.title.trim());
+
+  // General duplicate-review groups: ALL events (placed or not) sharing an exact (trimmed)
+  // title, grouped together for manual review — used by the duplicate-cleanup modal. Deletion
+  // is always an explicit, reviewed choice; nothing here deletes anything automatically.
+  const buildDuplicateGroups = () => {
+    const byTitle = new Map();
+    events.forEach((e) => {
+      const key = e.title?.trim();
+      if (!key) return;
+      if (!byTitle.has(key)) byTitle.set(key, []);
+      byTitle.get(key).push(e);
+    });
+    return Array.from(byTitle.entries())
+      .filter(([, items]) => items.length > 1)
+      .map(([title, items]) => ({ title, items }));
+  };
 
   // Library view: every event (placed + unplaced) that passes the current filters, grouped by category/audience/price
   const buildLibraryGroups = () => {
@@ -763,26 +844,16 @@ export default function InteractiveSchedule() {
   };
 
 
-  // ===== Auto-save to localStorage on changes =====
+  // ===== Auto-save this window's UI prefs to localStorage on changes =====
   useEffect(() => {
     if (isFirstAutoSaveRun.current) {
-      // Skip the very first invocation: it fires with the default/empty state, before the
-      // "load persisted state" effect's setEvents/setCategories have actually reached a
-      // render. Writing here would briefly overwrite real saved data with blanks — invisible
-      // in a single window (self-corrects a tick later), but a popped-out window's `storage`
-      // listener would catch that split-second bad write and wipe the other window too.
+      // Skip the very first invocation: it fires with default state, before the "load UI
+      // prefs" effect's setters have actually reached a render.
       isFirstAutoSaveRun.current = false;
-      return;
-    }
-    if (suppressNextSaveRef.current) {
-      suppressNextSaveRef.current = false;
       return;
     }
     try {
       const payload = {
-        startDate,
-        events,
-        categories,
         sidebarWidthPx,
         sidebarPos,
         notesBankOpen,
@@ -800,9 +871,25 @@ export default function InteractiveSchedule() {
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch (e) {
-      console.warn("Failed to save schedule:", e);
+      console.warn("Failed to save UI prefs:", e);
     }
-  }, [startDate, events, categories, sidebarWidthPx, sidebarPos, notesBankOpen, notesBankWidthPx, notesBankColumns, autoBackupEnabled, autoBackupIntervalMin, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, filterAudience, searchText]);
+  }, [sidebarWidthPx, sidebarPos, notesBankOpen, notesBankWidthPx, notesBankColumns, autoBackupEnabled, autoBackupIntervalMin, dayColWidthPx, sumPlacedOnly, filterCategory, filterOrg, filterConfirmed, filterAudience, searchText]);
+
+  // Note: there is deliberately no "watch events/categories and save everything" effect here —
+  // each add/edit/delete/place action below calls a targeted per-row Supabase function directly
+  // (insertActivity, updateActivityFields, deleteActivityById, etc.) via runCloudWrite, so two
+  // people editing at the same time never clobber each other's unrelated changes. syncActivities/
+  // syncCategories (full-table reconciliation) are used only by the explicit JSON import/paste
+  // actions further down, where replacing the whole dataset really is the intent.
+
+  useEffect(() => {
+    if (isFirstStartDateSyncRun.current) { isFirstStartDateSyncRun.current = false; return; }
+    if (suppressStartDateSaveRef.current) { suppressStartDateSaveRef.current = false; return; }
+    updateStartDate(startDate).catch((err) => {
+      console.error(err);
+      setConflictMsg("שגיאה בשמירת תאריך ההתחלה לענן: " + err.message);
+    });
+  }, [startDate]);
 
 
   // Export
@@ -875,9 +962,14 @@ export default function InteractiveSchedule() {
       const data = JSON.parse(importText);
       if (data && Array.isArray(data.events) && typeof data.startDate === "string") {
         setStartDate(data.startDate);
-        if (Array.isArray(data.categories)) setCategories(data.categories);
-        setEvents(data.events.map(migrateEvent));
-        setConflictMsg(`ייבוא הושלם: נטענו ${data.events.length} אירועים.`);
+        const migrated = data.events.map(migrateEvent);
+        setEvents(migrated);
+        runCloudWrite(() => syncActivities(migrated));
+        if (Array.isArray(data.categories)) {
+          setCategories(data.categories);
+          runCloudWrite(() => syncCategories(data.categories));
+        }
+        setConflictMsg(`ייבוא הושלם: נטענו ${data.events.length} אירועים. שים/י לב: ייבוא JSON מחליף את כל הלוח הקיים בענן.`);
       } else {
         setConflictMsg("פורמט ייבוא לא תקין.");
       }
@@ -896,9 +988,14 @@ export default function InteractiveSchedule() {
         const data = JSON.parse(String(reader.result));
         if (data && Array.isArray(data.events) && typeof data.startDate === "string") {
           setStartDate(data.startDate);
-          if (Array.isArray(data.categories)) setCategories(data.categories);
-          setEvents(data.events.map(migrateEvent));
-          setConflictMsg(`ייבוא מהקובץ הצליח: ${data.events.length} אירועים נטענו.`);
+          const migrated = data.events.map(migrateEvent);
+          setEvents(migrated);
+          runCloudWrite(() => syncActivities(migrated));
+          if (Array.isArray(data.categories)) {
+            setCategories(data.categories);
+            runCloudWrite(() => syncCategories(data.categories));
+          }
+          setConflictMsg(`ייבוא מהקובץ הצליח: ${data.events.length} אירועים נטענו. שים/י לב: ייבוא JSON מחליף את כל הלוח הקיים בענן.`);
         } else {
           setConflictMsg("קובץ JSON לא תואם לפורמט צפוי.");
         }
@@ -1024,6 +1121,7 @@ export default function InteractiveSchedule() {
         return;
       }
       setEvents((prev) => [...prev, ...newEvents]);
+      runCloudWrite(() => insertActivities(newEvents));
       setConflictMsg(
         `יובאו ${summary.added} אירועים (${summary.placed} מוקמו בלוח, ${summary.unplaced} נוספו כפתקים ממתינים)` +
         (summary.unknownCategory ? `, ${summary.unknownCategory} עם קטגוריה לא מזוהה (סומנו "כללי")` : "") + "."
@@ -1086,17 +1184,24 @@ export default function InteractiveSchedule() {
       return;
     }
     setEvents((prev) => prev.map((e) => (e.id === selectedEvent.id ? candidate : e)));
+    runCloudWrite(() => updateActivityFields(selectedEvent.id, patch));
   };
 
   const deleteEvent = (id) => {
     setEvents((prev) => prev.filter((e) => e.id !== id));
     if (selectedEventId === id) setSelectedEventId(null);
+    runCloudWrite(() => deleteActivityById(id));
   };
   const toggleConfirmed = (id) => {
-    setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, confirmed: !e.confirmed } : e)));
+    const current = events.find((e) => e.id === id);
+    if (!current) return;
+    const nextConfirmed = !current.confirmed;
+    setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, confirmed: nextConfirmed } : e)));
+    runCloudWrite(() => updateActivityFields(id, { confirmed: nextConfirmed }));
   };
   const sendToBank = (id) => {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, placed: false, dayIndex: null, time: null } : e)));
+    runCloudWrite(() => updateActivityFields(id, { placed: false, dayIndex: null, time: null }));
   };
 
 
@@ -1209,7 +1314,7 @@ export default function InteractiveSchedule() {
           {events.filter((e) => !e.placed).filter(visibleEventsFilter).map((e) => (
             <div
               key={e.id}
-              className={`p-2 rounded mb-2 relative text-right cursor-pointer ${armedEventId === e.id ? "ring-2 ring-amber-500" : ""}`}
+              className={`p-2 rounded mb-2 relative text-right cursor-pointer ${armedEventId === e.id ? "ring-2 ring-amber-500" : ""} ${looksLikeDuplicate(e) ? "ring-2 ring-red-500" : ""}`}
               style={{ background: catByKey[e.categoryKey]?.color || "#93c5fd" }}
               draggable
               onDragStart={(ev) => {
@@ -1234,12 +1339,15 @@ export default function InteractiveSchedule() {
                 </button>
               </div>
               <div className="absolute top-1 right-1 flex gap-1">
-                <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
-                <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
+                <button className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); setSelectedEventId(e.id); }} title="עריכה">✎</button>
+                <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }} title="מחיקה">✕</button>
               </div>
               <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
               <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
               {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
+              {looksLikeDuplicate(e) && (
+                <div className="text-[11px] text-red-700 font-semibold mt-1">⚠ כבר מתוזמן בלוח — כפילות אפשרית</div>
+              )}
               <AudienceBadges audiences={e.audiences} />
             </div>
           ))}
@@ -1293,8 +1401,8 @@ export default function InteractiveSchedule() {
                     </button>
                   </div>
                   <div className="absolute top-1 right-1 flex gap-1">
-                    <button className="bg-white/80 rounded px-1 text-[10px]" onClick={() => setSelectedEventId(e.id)} title="עריכה">✎</button>
-                    <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={() => deleteEvent(e.id)} title="מחיקה">✕</button>
+                    <button className="bg-white/80 rounded px-1 text-[10px]" onClick={(ev) => { ev.stopPropagation(); setSelectedEventId(e.id); }} title="עריכה">✎</button>
+                    <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }} title="מחיקה">✕</button>
                   </div>
                   <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
                   <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
@@ -1379,6 +1487,12 @@ export default function InteractiveSchedule() {
         <div className="flex items-center justify-between mb-2">
           <h1 className="font-bold text-lg">בנק פתקים — {startDate}</h1>
           <a href={window.location.pathname} className="text-xs border rounded px-2 py-1">↩ תצוגה מלאה</a>
+        </div>
+        <div
+          className={`text-xs border rounded px-2 py-1 mb-2 inline-block ${realtimeStatus === "SUBSCRIBED" ? "bg-green-50 text-green-700 border-green-300" : "bg-red-50 text-red-700 border-red-300"}`}
+          title={lastRealtimeEvent ? `עדכון אחרון: ${lastRealtimeEvent}` : "עדיין לא התקבל עדכון בזמן אמת"}
+        >
+          🔌 {realtimeStatus}{lastRealtimeEvent ? ` · ${lastRealtimeEvent}` : ""} · {events.length} אירועים בזיכרון
         </div>
         {armedEvent && (
           <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-400 text-amber-900 text-xs rounded px-2 py-1.5 mb-2">
@@ -1478,6 +1592,21 @@ export default function InteractiveSchedule() {
         <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={printPDF}>הדפס / ייצא PDF</button>
         <button className="bg-gray-700 text-white px-3 py-1 rounded" onClick={exportCSV}>ייצא CSV</button>
         <button className="px-3 py-1 rounded border" title="נקה את הנתונים השמורים בדפדפן" onClick={() => { localStorage.removeItem(STORAGE_KEY); }}>נקה שמירה מקומית</button>
+        <div className="text-sm font-medium text-gray-700 bg-gray-100 border rounded px-2 py-1" title="אירועים ממוקמים בלוח מתוך סך הכל">
+          📅 {events.filter((e) => e.placed).length} מתוזמנים ({events.length} סה״כ)
+        </div>
+        <div
+          className={`text-xs border rounded px-2 py-1 ${realtimeStatus === "SUBSCRIBED" ? "bg-green-50 text-green-700 border-green-300" : "bg-red-50 text-red-700 border-red-300"}`}
+          title={lastRealtimeEvent ? `עדכון אחרון: ${lastRealtimeEvent}` : "עדיין לא התקבל עדכון בזמן אמת"}
+        >
+          🔌 {realtimeStatus}{lastRealtimeEvent ? ` · ${lastRealtimeEvent}` : ""}
+        </div>
+        {session?.user?.email && (
+          <div className="text-xs text-gray-600 flex items-center gap-2 mr-auto">
+            <span>מחובר/ת: {session.user.email}</span>
+            <button className="border rounded px-2 py-1" onClick={onSignOut}>יציאה</button>
+          </div>
+        )}
         {conflictMsg && (
           <div className="text-xs text-red-700 bg-red-50 border border-red-200 px-2 py-1 rounded">{conflictMsg}</div>
         )}
@@ -1558,6 +1687,7 @@ export default function InteractiveSchedule() {
 
             {/* Category manager */}
             <button className="bg-gray-800 text-white px-3 py-2 rounded w-full" onClick={() => setShowCategoriesModal(true)}>🏷️ ניהול קטגוריות</button>
+            <button className="bg-red-700 text-white px-3 py-2 rounded w-full" onClick={() => { setDuplicateIdsToDelete(new Set()); setShowDuplicatesModal(true); }}>🧹 בדיקת כפילויות</button>
           </div>
         </aside>
 
@@ -1856,21 +1986,117 @@ export default function InteractiveSchedule() {
               <div className="space-y-2">
                 {categories.map((c) => (
                   <div key={c.key} className="flex items-center gap-2">
-                    <input className="border p-1 flex-1" value={c.name} onChange={(e) => setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, name: e.target.value } : x))} />
-                    <input type="color" className="w-10 h-8 p-0 border rounded" value={c.color} onChange={(e) => setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, color: e.target.value } : x))} />
-                    <button className="px-2 py-1 text-red-700 border rounded" onClick={() => {
-                      setEvents((prev) => prev.map((e) => (e.categoryKey === c.key ? { ...e, categoryKey: "general" } : e)));
-                      setCategories((prev) => prev.filter((x) => x.key !== c.key));
-                    }} disabled={c.key === "general"}>מחק</button>
+                    <input
+                      className="border p-1 flex-1"
+                      value={c.name}
+                      onChange={(e) => {
+                        const name = e.target.value;
+                        setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, name } : x));
+                        runCloudWrite(() => updateCategory(c.key, { name }));
+                      }}
+                    />
+                    <input
+                      type="color"
+                      className="w-10 h-8 p-0 border rounded"
+                      value={c.color}
+                      onChange={(e) => {
+                        const color = e.target.value;
+                        setCategories((prev) => prev.map((x) => x.key === c.key ? { ...x, color } : x));
+                        runCloudWrite(() => updateCategory(c.key, { color }));
+                      }}
+                    />
+                    <button
+                      className="px-2 py-1 text-red-700 border rounded"
+                      onClick={() => {
+                        setEvents((prev) => prev.map((e) => (e.categoryKey === c.key ? { ...e, categoryKey: "general" } : e)));
+                        setCategories((prev) => prev.filter((x) => x.key !== c.key));
+                        runCloudWrite(async () => {
+                          await reassignEventsCategory(c.key, "general");
+                          await deleteCategoryByKey(c.key);
+                        });
+                      }}
+                      disabled={c.key === "general"}
+                    >
+                      מחק
+                    </button>
                   </div>
                 ))}
               </div>
-              <button className="mt-3 bg-emerald-600 text-white px-3 py-1 rounded" onClick={() => {
-                const key = `cat_${Math.random().toString(36).slice(2, 7)}`;
-                setCategories((prev) => [...prev, { key, name: "קטגוריה חדשה", color: "#93c5fd" }]);
-              }}>הוסף קטגוריה</button>
+              <button
+                className="mt-3 bg-emerald-600 text-white px-3 py-1 rounded"
+                onClick={() => {
+                  const key = `cat_${Math.random().toString(36).slice(2, 7)}`;
+                  const newCat = { key, name: "קטגוריה חדשה", color: "#93c5fd" };
+                  setCategories((prev) => [...prev, newCat]);
+                  runCloudWrite(() => insertCategory(newCat));
+                }}
+              >
+                הוסף קטגוריה
+              </button>
               <div className="text-xs text-gray-500 mt-1">מחיקת קטגוריה מעבירה את האירועים שלה ל"כללי".</div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Duplicate-cleanup modal */}
+      {showDuplicatesModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setShowDuplicatesModal(false)}>
+          <div className="bg-white rounded-xl shadow-xl w-[640px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
+            <div className="flex items-center justify-between border-b p-3">
+              <div className="font-bold">בדיקת כפילויות</div>
+              <button className="px-3 py-1" onClick={() => setShowDuplicatesModal(false)}>סגור ✕</button>
+            </div>
+            <div className="max-h-[80vh] overflow-auto p-4">
+              <div className="text-xs text-gray-600 mb-3">
+                אירועים המופיעים כאן חולקים כותרת זהה. סמן/י את ההעתקים שברצונך למחוק (לא נמחק כלום עד שתלחצ/י על הכפתור בתחתית).
+              </div>
+              {(() => {
+                const groups = buildDuplicateGroups();
+                if (groups.length === 0) {
+                  return <div className="text-sm text-gray-500">לא נמצאו כפילויות לפי כותרת זהה. 🎉</div>;
+                }
+                return groups.map((group) => (
+                  <div key={group.title} className="mb-4 border rounded p-2">
+                    <div className="font-semibold text-sm mb-2">{group.title} ({group.items.length} עותקים)</div>
+                    {group.items.map((e) => (
+                      <label key={e.id} className="flex items-center gap-2 text-xs py-1 border-t first:border-t-0 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={duplicateIdsToDelete.has(e.id)}
+                          onChange={(ev) => {
+                            setDuplicateIdsToDelete((prev) => {
+                              const next = new Set(prev);
+                              if (ev.target.checked) next.add(e.id); else next.delete(e.id);
+                              return next;
+                            });
+                          }}
+                        />
+                        <span className="flex-1">
+                          {e.placed && e.dayIndex != null && e.time ? `ממוקם: יום ${e.dayIndex + 1} • ${e.time}` : "לא ממוקם"}
+                          {e.organization ? ` • ${e.organization}` : ""}
+                          {" • "}{catByKey[e.categoryKey]?.name || e.categoryKey}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                ));
+              })()}
+            </div>
+            {duplicateIdsToDelete.size > 0 && (
+              <div className="border-t p-3 flex items-center justify-between">
+                <span className="text-sm">{duplicateIdsToDelete.size} מסומנים למחיקה</span>
+                <button
+                  className="bg-red-700 text-white px-3 py-1 rounded"
+                  onClick={() => {
+                    duplicateIdsToDelete.forEach((id) => deleteEvent(id));
+                    setDuplicateIdsToDelete(new Set());
+                  }}
+                >
+                  מחק את המסומנים
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
