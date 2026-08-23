@@ -2102,7 +2102,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                 onDrop={(ev) => {
                   ev.preventDefault();
                   const idStr = ev.dataTransfer.getData("text/event-id");
-                  const id = idStr ? Number(idStr) : draggedEventId;
+                  const id = idStr || draggedEventId;
                   if (id == null) return;
                   const time = timeFromClientY(ev.currentTarget, ev.clientY);
                   placeEventExact(dayIndex, time, id, !!ev.altKey);
@@ -2500,7 +2500,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                   onDrop={(ev) => {
                     ev.preventDefault();
                     const idStr = ev.dataTransfer.getData("text/event-id");
-                    const id = idStr ? Number(idStr) : draggedEventId;
+                    const id = idStr || draggedEventId;
                     if (id == null) return;
                     const time = timeFromClientY(ev.currentTarget, ev.clientY);
                     placeEventExact(zoomDay, time, id, !!ev.altKey);
