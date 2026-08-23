@@ -570,6 +570,52 @@ function VideosEditor({ items, onChange }) {
   );
 }
 
+function TechRiderEditor({ textValue, fileUrl, onTextChange, onFileChange }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleFile = async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    setError("");
+    setUploading(true);
+    try {
+      const url = await uploadMedia("activity-riders", file);
+      onFileChange(url);
+    } catch (e) {
+      setError("שגיאה בהעלאת הקובץ: " + e.message);
+    } finally {
+      setUploading(false);
+      ev.target.value = "";
+    }
+  };
+
+  return (
+    <div>
+      <textarea
+        className="border p-1 w-full h-24 mb-2 text-sm"
+        placeholder="הכנס טקסט מפרט טכני..."
+        value={textValue}
+        onChange={(e) => onTextChange(e.target.value)}
+        dir="rtl"
+      />
+      {fileUrl ? (
+        <div className="flex items-center gap-2 text-sm mb-1">
+          <a href={fileUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">📄 פתח קובץ</a>
+          <button type="button" className="text-red-500 text-xs border rounded px-1" onClick={() => onFileChange("")}>הסר</button>
+        </div>
+      ) : (
+        <div>
+          <div className="text-xs text-gray-500 mb-1">העלה PDF או Word:</div>
+          <input type="file" accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handleFile} disabled={uploading} className="text-xs block" />
+          {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
+        </div>
+      )}
+      {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+    </div>
+  );
+}
+
 /** Calculate time from Y position inside day column */
 const timeFromClientY = (container, clientY) => {
   const rect = container.getBoundingClientRect();
@@ -598,6 +644,8 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     organization: "",
     images: [],
     videos: [],
+    techRiderText: "",
+    techRiderUrl: "",
   });
   const [draggedEventId, setDraggedEventId] = useState(null);
   const [selectedEventId, setSelectedEventId] = useState(null);
@@ -950,6 +998,8 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       contactPhone: "",
       images: [],
       videos: [],
+      techRiderText: "",
+      techRiderUrl: "",
     });
   };
 
@@ -1756,6 +1806,16 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             <VideosEditor items={selectedEvent.videos} onChange={(videos) => updateSelectedEvent({ videos })} />
           </div>
 
+          <label className="block text-sm mb-1">מפרט טכני (ריידר)</label>
+          <div className="mb-2">
+            <TechRiderEditor
+              textValue={selectedEvent.techRiderText || ""}
+              fileUrl={selectedEvent.techRiderUrl || ""}
+              onTextChange={(v) => updateSelectedEvent({ techRiderText: v })}
+              onFileChange={(v) => updateSelectedEvent({ techRiderUrl: v })}
+            />
+          </div>
+
           <label className="block text-sm mb-1">איש קשר</label>
           <input type="text" className="border p-1 w-full mb-2" value={selectedEvent.contact || ""} onChange={(e) => updateSelectedEvent({ contact: e.target.value })} />
 
@@ -2146,10 +2206,11 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                         <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                       </div>
                       <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
-                      {(Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) ? (
+                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl) ? (
                         <div className="px-2 text-[10px] leading-none">
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                          {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
                         </div>
                       ) : null}
                       {e.organization && (
@@ -2543,10 +2604,11 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                         </div>
                         <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
-                      {(Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) ? (
+                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl) ? (
                         <div className="px-2 text-[10px] leading-none">
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                          {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
                         </div>
                       ) : null}
                         {e.organization && (
