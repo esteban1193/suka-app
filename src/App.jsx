@@ -658,7 +658,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const [cloudFlash, setCloudFlash] = useState(null); // { type: "ok" | "err", msg: string } | null
   const cloudFlashTimerRef = useRef(null);
   const [startDate, setStartDate] = useState(() => {
-    const today = new Date();
+    const today = new Date("2026-09-25");
     const y = today.getFullYear();
     const m = (today.getMonth() + 1).toString().padStart(2, "0");
     const d = today.getDate().toString().padStart(2, "0");
