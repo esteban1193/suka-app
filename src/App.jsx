@@ -632,6 +632,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [newEvent, setNewEvent] = useState({
     confirmed: false,
+    dataComplete: false,
     title: "",
     duration: 30,
     costItems: [],
@@ -980,11 +981,12 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const addEvent = () => {
     if (!newEvent.title.trim()) return;
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const created = { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed };
+    const created = { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed, dataComplete: !!newEvent.dataComplete };
     setEvents((prev) => [...prev, created]);
     runCloudWrite(() => insertActivity(created));
     setNewEvent({
       confirmed: false,
+      dataComplete: false,
       title: "",
       duration: 30,
       costItems: [],
@@ -1551,6 +1553,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, confirmed: nextConfirmed } : e)));
     runCloudWrite(() => updateActivityFields(id, { confirmed: nextConfirmed }));
   };
+  const toggleDataComplete = (id) => {
+    const current = events.find((e) => e.id === id);
+    if (!current) return;
+    const next = !current.dataComplete;
+    setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, dataComplete: next } : e)));
+    runCloudWrite(() => updateActivityFields(id, { dataComplete: next }));
+  };
   const sendToBank = (id) => {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, placed: false, dayIndex: null, time: null } : e)));
     runCloudWrite(() => updateActivityFields(id, { placed: false, dayIndex: null, time: null }));
@@ -1841,9 +1850,20 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             <AudienceCheckboxes selected={selectedEvent.audiences} onChange={(audiences) => updateSelectedEvent({ audiences })} />
           </div>
 
-          <div className="text-xs text-gray-600 mb-2">
+          <div className="text-xs text-gray-600 mb-3">
             {selectedEvent.placed && selectedEvent.dayIndex != null && selectedEvent.time ? `ממוקם: יום ${selectedEvent.dayIndex + 1} • ${selectedEvent.time}` : "עדיין לא ננעץ בלוח"}
           </div>
+
+          <label className="flex items-center gap-2 mb-3 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="w-4 h-4 accent-green-600"
+              checked={!!selectedEvent.dataComplete}
+              onChange={() => toggleDataComplete(selectedEvent.id)}
+            />
+            <span className="text-sm font-medium">✅ כל הפרטים הוזנו</span>
+          </label>
+
           <div className="flex flex-wrap gap-2">
             <button className="bg-indigo-600 text-white px-3 py-1 rounded" onClick={() => setSelectedEventId(null)}>סיום עריכה</button>
             {selectedEvent.placed && (
@@ -2211,6 +2231,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
                           {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
+                          {e.dataComplete && <span title="כל הפרטים הוזנו"> ✅</span>}
                         </div>
                       ) : null}
                       {e.organization && (
@@ -2609,6 +2630,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
                           {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
+                          {e.dataComplete && <span title="כל הפרטים הוזנו"> ✅</span>}
                         </div>
                       ) : null}
                         {e.organization && (
