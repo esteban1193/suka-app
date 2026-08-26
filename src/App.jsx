@@ -616,6 +616,54 @@ function TechRiderEditor({ textValue, fileUrl, onTextChange, onFileChange }) {
   );
 }
 
+const CHECKER_BG = {
+  backgroundImage: "linear-gradient(45deg,#bbb 25%,transparent 25%),linear-gradient(-45deg,#bbb 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#bbb 75%),linear-gradient(-45deg,transparent 75%,#bbb 75%)",
+  backgroundSize: "10px 10px",
+  backgroundPosition: "0 0,0 5px,5px -5px,-5px 0",
+  backgroundColor: "#fff",
+};
+
+function LogoEditor({ url, onChange }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleFile = async (ev) => {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    try {
+      const uploaded = await uploadMedia("activity-images", file);
+      onChange(uploaded);
+    } catch (err) {
+      setError("שגיאה בהעלאת הלוגו: " + err.message);
+    } finally {
+      setUploading(false);
+      ev.target.value = "";
+    }
+  };
+
+  return (
+    <div>
+      {url ? (
+        <div className="flex items-start gap-3 mb-2">
+          <div className="rounded border p-1 w-24 h-24 flex items-center justify-center" style={CHECKER_BG}>
+            <img src={url} alt="לוגו" className="max-w-full max-h-full object-contain" />
+          </div>
+          <button type="button" className="text-red-500 text-xs border rounded px-2 py-1 mt-1" onClick={() => onChange("")}>הסר לוגו</button>
+        </div>
+      ) : (
+        <div>
+          <input type="file" accept="image/png,image/svg+xml,image/*" onChange={handleFile} disabled={uploading} className="text-xs block" />
+          <div className="text-[10px] text-gray-500 mt-1">מומלץ: PNG עם רקע שקוף</div>
+          {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
+        </div>
+      )}
+      {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+    </div>
+  );
+}
+
 /** Calculate time from Y position inside day column */
 const timeFromClientY = (container, clientY) => {
   const rect = container.getBoundingClientRect();
@@ -647,6 +695,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     videos: [],
     techRiderText: "",
     techRiderUrl: "",
+    logoUrl: "",
   });
   const [draggedEventId, setDraggedEventId] = useState(null);
   const [selectedEventId, setSelectedEventId] = useState(null);
@@ -1805,6 +1854,11 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
           </div>
 
+          <label className="block text-sm mb-1">לוגו <span className="text-gray-400 font-normal">(PNG שקוף מומלץ)</span></label>
+          <div className="mb-2">
+            <LogoEditor url={selectedEvent.logoUrl || ""} onChange={(logoUrl) => updateSelectedEvent({ logoUrl })} />
+          </div>
+
           <label className="block text-sm mb-1">תמונות</label>
           <div className="mb-2">
             <ImagesEditor items={selectedEvent.images} onChange={(images) => updateSelectedEvent({ images })} />
@@ -2226,10 +2280,11 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                         <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                       </div>
                       <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
-                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl) ? (
+                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl || e.logoUrl) ? (
                         <div className="px-2 text-[10px] leading-none">
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                          {e.logoUrl && <span title="לוגו מצורף"> 🏷️</span>}
                           {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
                           {e.dataComplete && <span title="כל הפרטים הוזנו"> ✅</span>}
                         </div>
@@ -2625,10 +2680,11 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                         </div>
                         <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
-                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl) ? (
+                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl || e.logoUrl) ? (
                         <div className="px-2 text-[10px] leading-none">
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                          {e.logoUrl && <span title="לוגו מצורף"> 🏷️</span>}
                           {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
                           {e.dataComplete && <span title="כל הפרטים הוזנו"> ✅</span>}
                         </div>

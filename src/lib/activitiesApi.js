@@ -34,6 +34,7 @@ export function rowToEvent(row) {
     videos: row.videos || [],
     techRiderText: row.tech_rider_text || "",
     techRiderUrl: row.tech_rider_url || "",
+    logoUrl: row.logo_url || "",
   };
 }
 
@@ -57,6 +58,7 @@ const FIELD_MAP = {
   videos: "videos",
   techRiderText: "tech_rider_text",
   techRiderUrl: "tech_rider_url",
+  logoUrl: "logo_url",
 };
 
 // Columns that are NOT NULL in the schema, with the same default the column itself uses.
@@ -81,6 +83,7 @@ const NOT_NULL_DEFAULTS = {
   videos: [],
   techRiderText: "",
   techRiderUrl: "",
+  logoUrl: "",
 };
 
 // app event shape -> full DB row (every column, with defaults applied) — for INSERT, where every
