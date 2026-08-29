@@ -26,11 +26,15 @@ export function rowToEvent(row) {
     contactPhone: row.contact_phone,
     organization: row.organization,
     confirmed: row.confirmed,
+    dataComplete: row.data_complete || false,
     placed: row.placed,
     dayIndex: row.day_index,
     time: row.time,
     images: row.images || [],
     videos: row.videos || [],
+    techRiderText: row.tech_rider_text || "",
+    techRiderUrl: row.tech_rider_url || "",
+    logoUrl: row.logo_url || "",
   };
 }
 
@@ -46,11 +50,15 @@ const FIELD_MAP = {
   contactPhone: "contact_phone",
   organization: "organization",
   confirmed: "confirmed",
+  dataComplete: "data_complete",
   placed: "placed",
   dayIndex: "day_index",
   time: "time",
   images: "images",
   videos: "videos",
+  techRiderText: "tech_rider_text",
+  techRiderUrl: "tech_rider_url",
+  logoUrl: "logo_url",
 };
 
 // Columns that are NOT NULL in the schema, with the same default the column itself uses.
@@ -69,9 +77,13 @@ const NOT_NULL_DEFAULTS = {
   contactPhone: "",
   organization: "",
   confirmed: false,
+  dataComplete: false,
   placed: false,
   images: [],
   videos: [],
+  techRiderText: "",
+  techRiderUrl: "",
+  logoUrl: "",
 };
 
 // app event shape -> full DB row (every column, with defaults applied) — for INSERT, where every

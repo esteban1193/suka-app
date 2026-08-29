@@ -570,6 +570,100 @@ function VideosEditor({ items, onChange }) {
   );
 }
 
+function TechRiderEditor({ textValue, fileUrl, onTextChange, onFileChange }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleFile = async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    setError("");
+    setUploading(true);
+    try {
+      const url = await uploadMedia("activity-riders", file);
+      onFileChange(url);
+    } catch (e) {
+      setError("שגיאה בהעלאת הקובץ: " + e.message);
+    } finally {
+      setUploading(false);
+      ev.target.value = "";
+    }
+  };
+
+  return (
+    <div>
+      <textarea
+        className="border p-1 w-full h-24 mb-2 text-sm"
+        placeholder="הכנס טקסט מפרט טכני..."
+        value={textValue}
+        onChange={(e) => onTextChange(e.target.value)}
+        dir="rtl"
+      />
+      {fileUrl ? (
+        <div className="flex items-center gap-2 text-sm mb-1">
+          <a href={fileUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">📄 פתח קובץ</a>
+          <button type="button" className="text-red-500 text-xs border rounded px-1" onClick={() => onFileChange("")}>הסר</button>
+        </div>
+      ) : (
+        <div>
+          <div className="text-xs text-gray-500 mb-1">העלה PDF או Word:</div>
+          <input type="file" accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handleFile} disabled={uploading} className="text-xs block" />
+          {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
+        </div>
+      )}
+      {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+    </div>
+  );
+}
+
+const CHECKER_BG = {
+  backgroundImage: "linear-gradient(45deg,#bbb 25%,transparent 25%),linear-gradient(-45deg,#bbb 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#bbb 75%),linear-gradient(-45deg,transparent 75%,#bbb 75%)",
+  backgroundSize: "10px 10px",
+  backgroundPosition: "0 0,0 5px,5px -5px,-5px 0",
+  backgroundColor: "#fff",
+};
+
+function LogoEditor({ url, onChange }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleFile = async (ev) => {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    try {
+      const uploaded = await uploadMedia("activity-images", file);
+      onChange(uploaded);
+    } catch (err) {
+      setError("שגיאה בהעלאת הלוגו: " + err.message);
+    } finally {
+      setUploading(false);
+      ev.target.value = "";
+    }
+  };
+
+  return (
+    <div>
+      {url ? (
+        <div className="flex items-start gap-3 mb-2">
+          <div className="rounded border p-1 w-24 h-24 flex items-center justify-center" style={CHECKER_BG}>
+            <img src={url} alt="לוגו" className="max-w-full max-h-full object-contain" />
+          </div>
+          <button type="button" className="text-red-500 text-xs border rounded px-2 py-1 mt-1" onClick={() => onChange("")}>הסר לוגו</button>
+        </div>
+      ) : (
+        <div>
+          <input type="file" accept="image/png,image/svg+xml,image/*" onChange={handleFile} disabled={uploading} className="text-xs block" />
+          <div className="text-[10px] text-gray-500 mt-1">מומלץ: PNG עם רקע שקוף</div>
+          {uploading && <div className="text-xs text-gray-500 mt-1">מעלה...</div>}
+        </div>
+      )}
+      {error && <div className="text-xs text-red-600 mt-1">{error}</div>}
+    </div>
+  );
+}
+
 /** Calculate time from Y position inside day column */
 const timeFromClientY = (container, clientY) => {
   const rect = container.getBoundingClientRect();
@@ -586,6 +680,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [newEvent, setNewEvent] = useState({
     confirmed: false,
+    dataComplete: false,
     title: "",
     duration: 30,
     costItems: [],
@@ -598,6 +693,9 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     organization: "",
     images: [],
     videos: [],
+    techRiderText: "",
+    techRiderUrl: "",
+    logoUrl: "",
   });
   const [draggedEventId, setDraggedEventId] = useState(null);
   const [selectedEventId, setSelectedEventId] = useState(null);
@@ -610,7 +708,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const [cloudFlash, setCloudFlash] = useState(null); // { type: "ok" | "err", msg: string } | null
   const cloudFlashTimerRef = useRef(null);
   const [startDate, setStartDate] = useState(() => {
-    const today = new Date();
+    const today = new Date("2026-09-25");
     const y = today.getFullYear();
     const m = (today.getMonth() + 1).toString().padStart(2, "0");
     const d = today.getDate().toString().padStart(2, "0");
@@ -938,11 +1036,12 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const addEvent = () => {
     if (!newEvent.title.trim()) return;
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const created = { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed };
+    const created = { ...newEvent, id, placed: false, confirmed: !!newEvent.confirmed, dataComplete: !!newEvent.dataComplete };
     setEvents((prev) => [...prev, created]);
     runCloudWrite(() => insertActivity(created));
     setNewEvent({
       confirmed: false,
+      dataComplete: false,
       title: "",
       duration: 30,
       costItems: [],
@@ -956,6 +1055,8 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       contactPhone: "",
       images: [],
       videos: [],
+      techRiderText: "",
+      techRiderUrl: "",
     });
   };
 
@@ -1507,6 +1608,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, confirmed: nextConfirmed } : e)));
     runCloudWrite(() => updateActivityFields(id, { confirmed: nextConfirmed }));
   };
+  const toggleDataComplete = (id) => {
+    const current = events.find((e) => e.id === id);
+    if (!current) return;
+    const next = !current.dataComplete;
+    setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, dataComplete: next } : e)));
+    runCloudWrite(() => updateActivityFields(id, { dataComplete: next }));
+  };
   const sendToBank = (id) => {
     setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, placed: false, dayIndex: null, time: null } : e)));
     runCloudWrite(() => updateActivityFields(id, { placed: false, dayIndex: null, time: null }));
@@ -1752,6 +1860,11 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
           </div>
 
+          <label className="block text-sm mb-1">לוגו <span className="text-gray-400 font-normal">(PNG שקוף מומלץ)</span></label>
+          <div className="mb-2">
+            <LogoEditor url={selectedEvent.logoUrl || ""} onChange={(logoUrl) => updateSelectedEvent({ logoUrl })} />
+          </div>
+
           <label className="block text-sm mb-1">תמונות</label>
           <div className="mb-2">
             <ImagesEditor items={selectedEvent.images} onChange={(images) => updateSelectedEvent({ images })} />
@@ -1760,6 +1873,16 @@ export default function InteractiveSchedule({ session, onSignOut }) {
           <label className="block text-sm mb-1">וידאו</label>
           <div className="mb-2">
             <VideosEditor items={selectedEvent.videos} onChange={(videos) => updateSelectedEvent({ videos })} />
+          </div>
+
+          <label className="block text-sm mb-1">מפרט טכני (ריידר)</label>
+          <div className="mb-2">
+            <TechRiderEditor
+              textValue={selectedEvent.techRiderText || ""}
+              fileUrl={selectedEvent.techRiderUrl || ""}
+              onTextChange={(v) => updateSelectedEvent({ techRiderText: v })}
+              onFileChange={(v) => updateSelectedEvent({ techRiderUrl: v })}
+            />
           </div>
 
           <label className="block text-sm mb-1">איש קשר</label>
@@ -1787,9 +1910,20 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             <AudienceCheckboxes selected={selectedEvent.audiences} onChange={(audiences) => updateSelectedEvent({ audiences })} />
           </div>
 
-          <div className="text-xs text-gray-600 mb-2">
+          <div className="text-xs text-gray-600 mb-3">
             {selectedEvent.placed && selectedEvent.dayIndex != null && selectedEvent.time ? `ממוקם: יום ${selectedEvent.dayIndex + 1} • ${selectedEvent.time}` : "עדיין לא ננעץ בלוח"}
           </div>
+
+          <label className="flex items-center gap-2 mb-3 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="w-4 h-4 accent-green-600"
+              checked={!!selectedEvent.dataComplete}
+              onChange={() => toggleDataComplete(selectedEvent.id)}
+            />
+            <span className="text-sm font-medium">✅ כל הפרטים הוזנו</span>
+          </label>
+
           <div className="flex flex-wrap gap-2">
             <button className="bg-indigo-600 text-white px-3 py-1 rounded" onClick={() => setSelectedEventId(null)}>סיום עריכה</button>
             {selectedEvent.placed && (
@@ -2114,7 +2248,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                 onDrop={(ev) => {
                   ev.preventDefault();
                   const idStr = ev.dataTransfer.getData("text/event-id");
-                  const id = idStr ? Number(idStr) : draggedEventId;
+                  const id = idStr || draggedEventId;
                   if (id == null) return;
                   const time = timeFromClientY(ev.currentTarget, ev.clientY);
                   placeEventExact(dayIndex, time, id, !!ev.altKey);
@@ -2158,10 +2292,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                         <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                       </div>
                       <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
-                      {(Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) ? (
+                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl || e.logoUrl) ? (
                         <div className="px-2 text-[10px] leading-none">
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                          {e.logoUrl && <span title="לוגו מצורף"> 🏷️</span>}
+                          {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
+                          {e.dataComplete && <span title="כל הפרטים הוזנו"> ✅</span>}
                         </div>
                       ) : null}
                       {e.organization && (
@@ -2512,7 +2649,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                   onDrop={(ev) => {
                     ev.preventDefault();
                     const idStr = ev.dataTransfer.getData("text/event-id");
-                    const id = idStr ? Number(idStr) : draggedEventId;
+                    const id = idStr || draggedEventId;
                     if (id == null) return;
                     const time = timeFromClientY(ev.currentTarget, ev.clientY);
                     placeEventExact(zoomDay, time, id, !!ev.altKey);
@@ -2555,10 +2692,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           <button title="מחיקה" className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }}>✕</button>
                         </div>
                         <div className={"px-2 pt-5 font-semibold text-[13px] " + (e.duration > 60 ? "" : "truncate")} style={e.duration > 60 ? { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } : undefined}>{e.title || "ללא כותרת"}</div>
-                      {(Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) ? (
+                      {((Array.isArray(e.images) && e.images.length > 0) || (Array.isArray(e.videos) && e.videos.length > 0) || e.techRiderText || e.techRiderUrl || e.logoUrl) ? (
                         <div className="px-2 text-[10px] leading-none">
                           {Array.isArray(e.images) && e.images.length > 0 && <span title={`${e.images.length} תמונות מצורפות`}>🖼️</span>}
                           {Array.isArray(e.videos) && e.videos.length > 0 && <span title={`${e.videos.length} סרטונים מצורפים`}> 🎬</span>}
+                          {e.logoUrl && <span title="לוגו מצורף"> 🏷️</span>}
+                          {(e.techRiderText || e.techRiderUrl) && <span title="מפרט טכני מצורף"> 📄</span>}
+                          {e.dataComplete && <span title="כל הפרטים הוזנו"> ✅</span>}
                         </div>
                       ) : null}
                         {e.organization && (
