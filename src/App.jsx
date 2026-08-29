@@ -730,7 +730,13 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   const flashCloudStatus = (type, msg) => {
     clearTimeout(cloudFlashTimerRef.current);
     setCloudFlash({ type, msg });
-    cloudFlashTimerRef.current = setTimeout(() => setCloudFlash(null), type === "ok" ? 2000 : 6000);
+    // Success auto-clears quickly; errors stay until manually dismissed — an auto-dismissing
+    // error is easy to miss if you're not looking at the screen the instant a write fails
+    // (e.g. right after adding an event), which is exactly what let a failed insert go unnoticed
+    // once before.
+    if (type === "ok") {
+      cloudFlashTimerRef.current = setTimeout(() => setCloudFlash(null), 2000);
+    }
   };
 
   const runCloudWrite = (fn) => {
@@ -1801,11 +1807,14 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       <div className="p-3" dir="rtl">
         {cloudFlash && (
           <div
-            className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border ${
+            className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border flex items-center gap-2 ${
               cloudFlash.type === "ok" ? "bg-green-50 text-green-800 border-green-300" : "bg-red-50 text-red-800 border-red-300"
             }`}
           >
-            {cloudFlash.msg}
+            <span>{cloudFlash.msg}</span>
+            {cloudFlash.type === "err" && (
+              <button className="font-bold px-1" onClick={() => setCloudFlash(null)} title="סגור">✕</button>
+            )}
           </div>
         )}
         <div className="flex items-center justify-between mb-2">
@@ -1836,11 +1845,14 @@ export default function InteractiveSchedule({ session, onSignOut }) {
           (or any other modal, all z-50) is open on top of it. See cloudFlash/flashCloudStatus. */}
       {cloudFlash && (
         <div
-          className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border print:hidden ${
+          className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border print:hidden flex items-center gap-2 ${
             cloudFlash.type === "ok" ? "bg-green-50 text-green-800 border-green-300" : "bg-red-50 text-red-800 border-red-300"
           }`}
         >
-          {cloudFlash.msg}
+          <span>{cloudFlash.msg}</span>
+          {cloudFlash.type === "err" && (
+            <button className="font-bold px-1" onClick={() => setCloudFlash(null)} title="סגור">✕</button>
+          )}
         </div>
       )}
       {/* Top Bar */}

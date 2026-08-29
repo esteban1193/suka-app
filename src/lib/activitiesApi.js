@@ -129,14 +129,24 @@ export async function updateStartDate(startDate) {
 // only ever touches the one row it actually changed, never anyone else's) =====
 
 export async function insertActivity(event) {
-  const { error } = await supabase.from("activities").insert(eventToRow(event));
+  // .select("id") forces PostgREST to return the row it actually created — belt-and-suspenders
+  // alongside the `error` check, so a "succeeded but nothing was actually inserted" case (however
+  // it might happen) is caught here instead of surfacing later as a confusing "row not found" on
+  // some unrelated future edit to this same event.
+  const { data, error } = await supabase.from("activities").insert(eventToRow(event)).select("id");
   if (error) throw error;
+  if (!data || data.length === 0) {
+    throw new Error(`ההוספה לא אושרה על ידי השרת (id=${event.id}) — ייתכן שהאירוע לא נשמר בפועל.`);
+  }
 }
 
 export async function insertActivities(events) {
   if (events.length === 0) return;
-  const { error } = await supabase.from("activities").insert(events.map(eventToRow));
+  const { data, error } = await supabase.from("activities").insert(events.map(eventToRow)).select("id");
   if (error) throw error;
+  if (!data || data.length !== events.length) {
+    throw new Error(`רק ${data?.length ?? 0} מתוך ${events.length} אירועים נשמרו בפועל בענן.`);
+  }
 }
 
 export async function updateActivityFields(id, patch) {
