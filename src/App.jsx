@@ -12,12 +12,12 @@ import {
 /* =====================
    Constants & Helpers
    ===================== */
-const SLOT_MIN = 30;
-const SLOT_PX = 40; // each 30-min slot height (px)
+const SLOT_MIN = 15;
+const SLOT_PX = 20; // each 15-min slot height (px) — half of the old 30-min/40px, so existing event box heights are unchanged
 
 const generateTimeSlots = () => {
   const slots = [];
-  let start = 9 * 60 + 30; // 09:30
+  let start = 10 * 60 + 30; // 10:30
   const end = 23 * 60; // 23:00
   while (start < end) {
     const h = Math.floor(start / 60).toString().padStart(2, "0");
@@ -29,7 +29,7 @@ const generateTimeSlots = () => {
 };
 const timeSlots = generateTimeSlots();
 
-const DURATIONS = [30, 60, 90, 120, 150, 180, 210, 240];
+const DURATIONS = [30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180]; // 15-min steps, capped at 3 hours
 
 const DEFAULT_CATEGORIES = [
   { key: "general", name: "כללי", color: "#60a5fa" },
@@ -330,11 +330,11 @@ const formatTimestampForFilename = (d) => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}`;
 };
 const durationLabel = (m) => {
-  if (m % 60 === 0) {
-    const h = m / 60;
-    return `${h} ${h === 1 ? "שעה" : "שעות"}`;
-  }
-  return `${Math.floor(m / 60)}:${(m % 60).toString().padStart(2, "0")} ש"`;
+  if (m < 60) return `${m} דק'`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  const hoursPart = h === 1 ? "שעה" : `${h} שעות`;
+  return rem === 0 ? hoursPart : `${hoursPart} ו-${rem} דק'`;
 };
 
 function CostItemsEditor({ items, onChange }) {
@@ -676,6 +676,11 @@ const timeFromClientY = (container, clientY) => {
    Component
    ===================== */
 export default function InteractiveSchedule({ session, onSignOut }) {
+  // UI-only cost privacy: costs/totals are hidden from every signed-in collaborator except this
+  // one account. Not a real security boundary — anyone with their own valid session token could
+  // still read cost_items straight from the Supabase API — just keeps the numbers out of the
+  // interface for everyone but the intended owner.
+  const isOwner = session?.user?.email === "esteban@gottfrieds.com";
   const [events, setEvents] = useState([]);
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [newEvent, setNewEvent] = useState({
@@ -1228,8 +1233,10 @@ export default function InteractiveSchedule({ session, onSignOut }) {
   
   const exportCSV = () => {
     // כותרות בעברית
+    // Cost columns are omitted entirely for anyone but the owner account — see isOwner.
     const headers = [
-      "כותרת","תאריך","מס׳ יום","שעה","משך (דק׳)","קטגוריה","קהל יעד","עלות כוללת","פירוט עלות",
+      "כותרת","תאריך","מס׳ יום","שעה","משך (דק׳)","קטגוריה","קהל יעד",
+      ...(isOwner ? ["עלות כוללת","פירוט עלות"] : []),
       "תיאור","איש קשר","טלפון","ארגון","נעוץ","סופי"
     ];
 
@@ -1250,8 +1257,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
         e.duration ?? "",
         catName,
         audienceNames,
-        eventTotal(e),
-        costBreakdown,
+        ...(isOwner ? [eventTotal(e), costBreakdown] : []),
         e.description ?? "",
         e.contact ?? "",
         (e.contactPhone || e.phone || ""),
@@ -1296,8 +1302,10 @@ export default function InteractiveSchedule({ session, onSignOut }) {
 
       const safeName = (s) => String(s || "").replace(/[\\/:*?"<>|]/g, "_").slice(0, 40) || "ללא_כותרת";
 
+      // Cost columns are omitted entirely for anyone but the owner account — see isOwner.
       const headers = [
-        "כותרת", "תאריך", "מס׳ יום", "שעה", "משך (דק׳)", "קטגוריה", "קהל יעד", "עלות כוללת", "פירוט עלות",
+        "כותרת", "תאריך", "מס׳ יום", "שעה", "משך (דק׳)", "קטגוריה", "קהל יעד",
+        ...(isOwner ? ["עלות כוללת", "פירוט עלות"] : []),
         "תיאור", "תקציר", "איש קשר", "טלפון", "ארגון", "נעוץ", "סופי", "קישורי וידאו", "קבצי תמונה מצורפים",
       ];
 
@@ -1334,7 +1342,8 @@ export default function InteractiveSchedule({ session, onSignOut }) {
 
         rows.push([
           e.title ?? "", date, e.dayIndex != null ? e.dayIndex + 1 : "", e.time ?? "", e.duration ?? "",
-          catName, audienceNames, eventTotal(e), costBreakdown,
+          catName, audienceNames,
+          ...(isOwner ? [eventTotal(e), costBreakdown] : []),
           e.description ?? "", e.summary ?? "", e.contact ?? "", (e.contactPhone || e.phone || ""),
           e.organization ?? "", e.placed ? 1 : 0, e.confirmed ? "כן" : "לא",
           videoLinks, imageFileNames.join("; "),
@@ -1438,7 +1447,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       ["- שורה 2 היא דוגמה — אפשר למחוק אותה ולהזין נתונים מתחת לכותרות."],
       ["- תאריך ושעה הם אופציונליים: אם ריקים, האירוע ייכנס כפתק ממתין (לא ממוקם בלוח)."],
       ["- יש להזין תאריך ושעה כטקסט רגיל בפורמט המוצג בדוגמה, לא כתאריך/שעה מעוצבים של אקסל."],
-      ["- שעה חייבת להיות אחת מחצאי השעה שבין 09:30 ל-23:00 (למשל 20:00 או 20:30)."],
+      ["- שעה חייבת להיות אחד מרבעי השעה שבין 10:30 ל-23:00 (למשל 20:00, 20:15, 20:30 או 20:45)."],
       [`- קהל יעד: אפשר לרשום כמה קהלים מופרדים ב-; מתוך: ${AUDIENCES.map((a) => a.name).join(", ")}`],
       ["- ניתן להזין עד 3 רכיבי עלות; אפשר להוסיף עוד רכיבים בתוך האפליקציה אחרי הייבוא."],
       [],
@@ -1759,7 +1768,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                 <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }} title="מחיקה">✕</button>
               </div>
               <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
-              <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
+              <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {isOwner && showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
               {e.organization && <div className="text-xs mt-1">ארגון: {e.organization}</div>}
               {looksLikeDuplicate(e) && (
                 <div className="text-[11px] text-red-700 font-semibold mt-1">⚠ כבר מתוזמן בלוח — כפילות אפשרית</div>
@@ -1821,7 +1830,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                     <button className="bg-white/80 rounded px-1 text-[10px] text-red-600" onClick={(ev) => { ev.stopPropagation(); deleteEvent(e.id); }} title="מחיקה">✕</button>
                   </div>
                   <div className="mt-5 text-base font-bold leading-5">{e.title || "ללא כותרת"}</div>
-                  <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
+                  <div className="text-xs text-gray-800 mt-1">משך: {e.duration} דק' {isOwner && showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}</div>
                   <div className="text-[11px] text-gray-700 mt-1">
                     {e.placed && e.dayIndex != null && e.time ? `ממוקם: יום ${e.dayIndex + 1} • ${e.time}` : "לא ממוקם"}
                   </div>
@@ -1855,10 +1864,14 @@ export default function InteractiveSchedule({ session, onSignOut }) {
             {DURATIONS.map((m) => (<option key={m} value={m}>{durationLabel(m)}</option>))}
           </select>
 
-          <label className="block text-sm mb-1">עלות (רכיבים)</label>
-          <div className="mb-2">
-            <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
-          </div>
+          {isOwner && (
+            <>
+              <label className="block text-sm mb-1">עלות (רכיבים)</label>
+              <div className="mb-2">
+                <CostItemsEditor items={selectedEvent.costItems} onChange={(costItems) => updateSelectedEvent({ costItems })} />
+              </div>
+            </>
+          )}
 
           <label className="block text-sm mb-1">לוגו <span className="text-gray-400 font-normal">(PNG שקוף מומלץ)</span></label>
           <div className="mb-2">
@@ -2062,14 +2075,16 @@ export default function InteractiveSchedule({ session, onSignOut }) {
           </select>
         </label>
 
-        <label className="text-sm flex items-center gap-2 print:hidden">
-          <input
-            type="checkbox"
-            checked={showPrices}
-            onChange={(e) => setShowPrices(e.target.checked)}
-          />
-          הצג מחירים בפתקים / בהדפסה
-        </label>
+        {isOwner && (
+          <label className="text-sm flex items-center gap-2 print:hidden">
+            <input
+              type="checkbox"
+              checked={showPrices}
+              onChange={(e) => setShowPrices(e.target.checked)}
+            />
+            הצג מחירים בפתקים / בהדפסה
+          </label>
+        )}
         <button className="bg-gray-800 text-white px-3 py-1 rounded" onClick={printPDF}>הדפס / ייצא PDF</button>
         <button className="bg-gray-700 text-white px-3 py-1 rounded" onClick={exportCSV}>ייצא CSV</button>
         <button className="px-3 py-1 rounded border" title="נקה את הנתונים השמורים בדפדפן" onClick={() => { localStorage.removeItem(STORAGE_KEY); }}>נקה שמירה מקומית</button>
@@ -2104,7 +2119,9 @@ export default function InteractiveSchedule({ session, onSignOut }) {
           <div className="sticky top-4 space-y-4 p-2">
             <div className="flex gap-2">
               <button className="bg-green-600 text-white px-3 py-2 rounded flex-1" onClick={() => setShowAddModal(true)}>+ הוסף אירוע</button>
-              <button className="bg-gray-800 text-white px-3 py-2 rounded flex-1" onClick={() => setShowTotalsModal(true)}>📊 סיכומים</button>
+              {isOwner && (
+                <button className="bg-gray-800 text-white px-3 py-2 rounded flex-1" onClick={() => setShowTotalsModal(true)}>📊 סיכומים</button>
+              )}
             </div>
 
             {/* Export / Import */}
@@ -2207,7 +2224,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                 {getHolidayLabel(d.dateKey) && (
                   <div className="text-[11px] text-rose-700 mt-0.5">{getHolidayLabel(d.dateKey)}</div>
                 )}
-                {showPrices && (<div className="text-xs mt-1">סה"כ: <span className="font-medium">₪{dayTotal(idx).toLocaleString()}</span></div>)}
+                {isOwner && showPrices && (<div className="text-xs mt-1">סה"כ: <span className="font-medium">₪{dayTotal(idx).toLocaleString()}</span></div>)}
               </div>
             ))}
           </div>
@@ -2305,7 +2322,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                         <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[10rem]">ארגון: {e.organization}</div>
                       )}
                       <div className="absolute bottom-1 right-2 text-[10px] opacity-85">
-                        {e.time} • {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}
+                        {e.time} • {e.duration} דק' {isOwner && showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}
                       </div>
                       {/* Resize handle */}
                       <div
@@ -2395,10 +2412,14 @@ export default function InteractiveSchedule({ session, onSignOut }) {
               <div className="mb-2">
                 <AudienceCheckboxes selected={newEvent.audiences} onChange={(audiences) => setNewEvent({ ...newEvent, audiences })} />
               </div>
-              <div className="text-xs mb-1 text-gray-600">עלות (רכיבים):</div>
-              <div className="mb-2">
-                <CostItemsEditor items={newEvent.costItems} onChange={(costItems) => setNewEvent({ ...newEvent, costItems })} />
-              </div>
+              {isOwner && (
+                <>
+                  <div className="text-xs mb-1 text-gray-600">עלות (רכיבים):</div>
+                  <div className="mb-2">
+                    <CostItemsEditor items={newEvent.costItems} onChange={(costItems) => setNewEvent({ ...newEvent, costItems })} />
+                  </div>
+                </>
+              )}
               <div className="text-xs mb-1 text-gray-600">תמונות:</div>
               <div className="mb-2">
                 <ImagesEditor items={newEvent.images} onChange={(images) => setNewEvent({ ...newEvent, images })} />
@@ -2422,7 +2443,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       {editEventModal}
 
       {/* Totals modal */}
-      {showTotalsModal && (
+      {isOwner && showTotalsModal && (
         <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-6 z-50 print:hidden overflow-auto" onClick={() => setShowTotalsModal(false)}>
           <div className="bg-white rounded-xl shadow-xl w-[520px] max-w-full" onClick={(e) => e.stopPropagation()} dir="rtl">
             <div className="flex items-center justify-between border-b p-3">
@@ -2705,7 +2726,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                           <div className="absolute bottom-5 right-2 text-[10px] opacity-85 truncate max-w-[12rem]">ארגון: {e.organization}</div>
                         )}
                         <div className="absolute bottom-1 right-2 text-[10px] opacity-85">
-                          {e.time} • {e.duration} דק' {showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}
+                          {e.time} • {e.duration} דק' {isOwner && showPrices && eventTotal(e) > 0 ? `• ₪${eventTotal(e)}` : ""}
                         </div>
                         {/* Resize handle */}
                         <div
@@ -2718,7 +2739,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
                     ))}
                 </div>
               </div>
-              {showPrices && (<div className="text-right mt-3 font-medium">סה"כ יום: ₪{dayTotal(zoomDay).toLocaleString()}</div>)}
+              {isOwner && showPrices && (<div className="text-right mt-3 font-medium">סה"כ יום: ₪{dayTotal(zoomDay).toLocaleString()}</div>)}
             </div>
           </div>
         </div>
