@@ -838,7 +838,7 @@ export default function InteractiveSchedule({ session, onSignOut }) {
     // (e.g. right after adding an event), which is exactly what let a failed insert go unnoticed
     // once before.
     if (type === "ok") {
-      cloudFlashTimerRef.current = setTimeout(() => setCloudFlash(null), 2000);
+      cloudFlashTimerRef.current = setTimeout(() => setCloudFlash(null), 3000);
     }
   };
 
@@ -1954,8 +1954,8 @@ export default function InteractiveSchedule({ session, onSignOut }) {
       <div className="p-3" dir="rtl">
         {cloudFlash && (
           <div
-            className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border flex items-center gap-2 ${
-              cloudFlash.type === "ok" ? "bg-green-50 text-green-800 border-green-300" : "bg-red-50 text-red-800 border-red-300"
+            className={`fixed top-4 left-1/2 -translate-x-1/2 z-[200] text-xl font-bold px-8 py-4 rounded-2xl shadow-2xl border-2 flex items-center gap-3 ${
+              cloudFlash.type === "ok" ? "bg-green-100 text-green-900 border-green-400" : "bg-red-100 text-red-900 border-red-400"
             }`}
           >
             <span>{cloudFlash.msg}</span>
@@ -1992,8 +1992,8 @@ export default function InteractiveSchedule({ session, onSignOut }) {
           (or any other modal, all z-50) is open on top of it. See cloudFlash/flashCloudStatus. */}
       {cloudFlash && (
         <div
-          className={`fixed top-2 left-1/2 -translate-x-1/2 z-[200] text-sm px-3 py-1.5 rounded shadow-lg border print:hidden flex items-center gap-2 ${
-            cloudFlash.type === "ok" ? "bg-green-50 text-green-800 border-green-300" : "bg-red-50 text-red-800 border-red-300"
+          className={`fixed top-4 left-1/2 -translate-x-1/2 z-[200] text-xl font-bold px-8 py-4 rounded-2xl shadow-2xl border-2 print:hidden flex items-center gap-3 ${
+            cloudFlash.type === "ok" ? "bg-green-100 text-green-900 border-green-400" : "bg-red-100 text-red-900 border-red-400"
           }`}
         >
           <span>{cloudFlash.msg}</span>
